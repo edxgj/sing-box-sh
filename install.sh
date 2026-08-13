@@ -77,8 +77,14 @@ init_base() {
     fi
 
     mkdir -p $CONFIG_DIR $CERT_DIR
+    
+    # 修复 sing-box 1.12.0+ geoip 字段被移除导致的内核校验崩溃问题
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"geoip":"private","outbound":"block"}]}}' > $CONFIG_FILE
+        echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > $CONFIG_FILE
+    else
+        # 对老版本配置进行热修复替换
+        sed -i 's/"geoip":"private"/"ip_is_private":true/g' $CONFIG_FILE
+        sed -i 's/"geoip": "private"/"ip_is_private": true/g' $CONFIG_FILE
     fi
 }
 
@@ -179,7 +185,9 @@ check_cert() {
 
 restart_service() {
     if ! /usr/local/bin/sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
-        echo -e "${RED}配置文件校验失败，请检查！${PLAIN}"
+        echo -e "${RED}配置文件校验失败，请检查语法或端口冲突！${PLAIN}"
+        # 输出真实的报错信息方便排查
+        /usr/local/bin/sing-box check -c $CONFIG_FILE
         return 1
     fi
     
@@ -197,7 +205,7 @@ depend() {
 EOF
         chmod +x /etc/init.d/sing-box
         rc-update add sing-box default >/dev/null 2>&1
-        rc-service sing-box restart
+        rc-service sing-box restart >/dev/null 2>&1
     else
         cat > /etc/systemd/system/sing-box.service << 'EOF'
 [Unit]
@@ -213,8 +221,9 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable sing-box --now >/dev/null 2>&1
-        systemctl restart sing-box
+        systemctl restart sing-box >/dev/null 2>&1
     fi
+    return 0
 }
 
 print_config_detail() {
@@ -319,6 +328,9 @@ add_config() {
 
     load_secrets
     DEF_PORT=$(rand_port)
+    
+    # 提前备份防止写入失败导致原有配置丢失
+    cp $CONFIG_FILE ${CONFIG_FILE}.bak
     
     case "$proto_idx" in
         1)
@@ -436,8 +448,14 @@ EOF
             ;;
     esac
     
-    restart_service
-    echo -e "${GREEN}配置已添加并生效！${PLAIN}"
+    if ! restart_service; then
+        echo -e "${RED}节点添加失败，已为您还原配置！${PLAIN}"
+        mv ${CONFIG_FILE}.bak $CONFIG_FILE
+        sleep 2
+        return
+    fi
+    
+    echo -e "${GREEN}配置已添加并成功生效！${PLAIN}"
     print_config_detail "$TAG"
     read -p "按回车键返回菜单..."
 }
@@ -501,12 +519,14 @@ modify_config() {
         sleep 1; return
     fi
 
+    cp $CONFIG_FILE ${CONFIG_FILE}.bak
+
     if [ "$action" == "uuid" ]; then
         read -p "请输入UUID(回车默认随机): " input_uuid
         NEW_AUTH=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
         echo -e "UUID: ${GREEN}${NEW_AUTH}${PLAIN}"
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid) = "'$NEW_AUTH'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
-        restart_service
+        if ! restart_service; then mv ${CONFIG_FILE}.bak $CONFIG_FILE; return; fi
         echo -e "${GREEN}节点 $TAG 的 UUID 已更新！${PLAIN}"
         sleep 2
     elif [ "$action" == "pass" ]; then
@@ -514,8 +534,8 @@ modify_config() {
         NEW_AUTH=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
         echo -e "密码: ${GREEN}${NEW_AUTH}${PLAIN}"
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].password) = "'$NEW_AUTH'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
-        restart_service
-        echo -e "${GREEN}节点 $TAG 的密码 已更新！${PLAIN}"
+        if ! restart_service; then mv ${CONFIG_FILE}.bak $CONFIG_FILE; return; fi
+        echo -e "${GREEN}节点 $TAG 的密码已更新！${PLAIN}"
         sleep 2
     elif [ "$action" == "port" ]; then
         NEW_PORT=$(rand_port)
@@ -538,8 +558,9 @@ modify_config() {
         NEW_TAG=$(echo "$TAG" | sed "s/-$OLD_PORT/-$NEW_PORT/")
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .tag) = "'$NEW_TAG'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
         TAG=$NEW_TAG
+        
+        if ! restart_service; then mv ${CONFIG_FILE}.bak $CONFIG_FILE; return; fi
         echo -e "${GREEN}端口已更改为: $NEW_PORT${PLAIN}"
-        restart_service
         echo -e "${GREEN}节点 $TAG 的配置已生效！${PLAIN}"
         sleep 2
     fi
