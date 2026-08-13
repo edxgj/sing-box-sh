@@ -10,6 +10,7 @@ CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 CERT_DIR="$CONFIG_DIR/cert"
 SECRETS_FILE="$CONFIG_DIR/.secrets"
+TMP_JSON="/tmp/sb_tmp.json"
 
 if [ -f /etc/alpine-release ]; then
     OS_TYPE="alpine"
@@ -22,10 +23,10 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# 核心修复：防止读取 $0 导致 bash 管道中断
-if [[ "$0" == *"bash"* ]] || [[ "$0" == *"/dev/fd/"* ]] || [ ! -f "/usr/local/bin/sb" ]; then
-    curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
-    chmod +x /usr/local/bin/sb
+if [[ "$0" != "/usr/local/bin/sb" ]]; then
+    cp -f "$0" /usr/local/bin/sb 2>/dev/null
+    chmod +x /usr/local/bin/sb 2>/dev/null
+    rm -f sb.sh install.sh 2>/dev/null
 fi
 
 rand_port() { shuf -i 10000-65000 -n 1; }
@@ -47,7 +48,7 @@ load_secrets() {
 }
 
 init_base() {
-    if ! command -v jq &> /dev/null || ! command -v sing-box &> /dev/null; then
+    if ! command -v jq &> /dev/null || [ ! -f "/usr/local/bin/sing-box" ]; then
         echo -e "${CYAN}==> 正在安装必要环境与内核...${PLAIN}"
         if [ "$OS_TYPE" == "alpine" ]; then
             apk update >/dev/null 2>&1
@@ -79,12 +80,6 @@ init_base() {
     if [ ! -f "$CONFIG_FILE" ]; then
         echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"geoip":"private","outbound":"block"}]}}' > $CONFIG_FILE
     fi
-    
-    load_secrets
-    if [ -z "$GLOBAL_UUID" ]; then
-        GLOBAL_UUID=$(sing-box generate uuid)
-        save_secret "GLOBAL_UUID" "$GLOBAL_UUID"
-    fi
 }
 
 check_cert() {
@@ -113,7 +108,7 @@ check_cert() {
 }
 
 restart_service() {
-    if ! sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
+    if ! /usr/local/bin/sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
         echo -e "${RED}配置文件校验失败，请检查！${PLAIN}"
         return 1
     fi
@@ -150,7 +145,91 @@ EOF
         systemctl enable sing-box --now >/dev/null 2>&1
         systemctl restart sing-box
     fi
-    echo -e "${GREEN}服务已重启并生效！${PLAIN}"
+}
+
+print_config_detail() {
+    local TAG=$1
+    local IP=$(get_ip)
+    load_secrets
+    
+    local TYPE=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .type' $CONFIG_FILE)
+    local PORT=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .listen_port' $CONFIG_FILE)
+    
+    echo -e "\n-------------- ${YELLOW}$TAG${PLAIN} -------------"
+    echo -e "协议 (protocol)\t\t\t= $TYPE"
+    
+    case "$TYPE" in
+        vless)
+            local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
+            if [[ "$TAG" == *"REALITY"* ]]; then
+                local SNI=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.server_name' $CONFIG_FILE)
+                local SID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.short_id[0]' $CONFIG_FILE)
+                local PUB=$(eval echo \$REALITY_PUB_${PORT})
+                echo -e "地址 (address)\t\t\t= $IP"
+                echo -e "端口 (port)\t\t\t= $PORT"
+                echo -e "用户ID (id)\t\t\t= $AUTH"
+                echo -e "流控 (flow)\t\t\t= xtls-rprx-vision"
+                echo -e "传输层安全 (TLS)\t\t= reality"
+                echo -e "伪装域名 (sni)\t\t\t= $SNI"
+                echo -e "公钥 (pbk)\t\t\t= $PUB"
+                echo -e "ShortId (sid)\t\t\t= $SID"
+                echo -e "------------- 链接 (URL) -------------"
+                echo "vless://${AUTH}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
+            elif [[ "$TAG" == *"Argo"* ]]; then
+                local A_IP=$(eval echo \$ARGO_IP_${PORT})
+                local A_DOM=$(eval echo \$ARGO_DOMAIN_${PORT})
+                echo -e "地址 (address)\t\t\t= $A_IP"
+                echo -e "端口 (port)\t\t\t= 443"
+                echo -e "用户ID (id)\t\t\t= $AUTH"
+                echo -e "传输协议 (network)\t\t= ws"
+                echo -e "传输层安全 (TLS)\t\t= tls"
+                echo -e "伪装域名 (sni)\t\t\t= $A_DOM"
+                echo -e "请求主机 (host)\t\t\t= $A_DOM"
+                echo -e "路径 (path)\t\t\t= /argo"
+                echo -e "------------- 链接 (URL) -------------"
+                echo "vless://${AUTH}@${A_IP}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
+            fi
+            ;;
+        hysteria2)
+            local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
+            echo -e "地址 (address)\t\t\t= $DOMAIN"
+            echo -e "端口 (port)\t\t\t= $PORT"
+            echo -e "密码 (password)\t\t\t= $AUTH"
+            echo -e "传输层安全 (TLS)\t\t= tls"
+            echo -e "应用层协议协商 (Alpn)\t\t= h3"
+            echo -e "跳过证书验证 (allowInsecure)\t= false"
+            echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            echo -e "------------- 链接 (URL) -------------"
+            echo "hysteria2://${AUTH}@${DOMAIN}:${PORT}?security=tls&alpn=h3&insecure=0&allowInsecure=0&sni=${DOMAIN}#${TAG}"
+            ;;
+        tuic)
+            local T_UUID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
+            local T_PASS=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
+            echo -e "地址 (address)\t\t\t= $DOMAIN"
+            echo -e "端口 (port)\t\t\t= $PORT"
+            echo -e "用户ID (id)\t\t\t= $T_UUID"
+            echo -e "密码 (password)\t\t\t= $T_PASS"
+            echo -e "传输层安全 (TLS)\t\t= tls"
+            echo -e "应用层协议协商 (Alpn)\t\t= h3"
+            echo -e "跳过证书验证 (allowInsecure)\t= false"
+            echo -e "拥塞控制算法 (congestion_control)= bbr"
+            echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            echo -e "------------- 链接 (URL) -------------"
+            echo "tuic://${T_UUID}:${T_PASS}@${DOMAIN}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&insecure=0&allowInsecure=0#${TAG}"
+            ;;
+        anytls)
+            local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
+            echo -e "地址 (address)\t\t\t= $DOMAIN"
+            echo -e "端口 (port)\t\t\t= $PORT"
+            echo -e "密码 (password)\t\t\t= $AUTH"
+            echo -e "传输层安全 (TLS)\t\t= tls"
+            echo -e "跳过证书验证 (allowInsecure)\t= false"
+            echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            echo -e "------------- 链接 (URL) -------------"
+            echo "anytls://${AUTH}@${DOMAIN}:${PORT}?sni=${DOMAIN}&allowInsecure=0&insecure=0#${TAG}"
+            ;;
+    esac
+    echo -e "\n${YELLOW}警告! 某些客户端如(V2rayN 等)导入URL需手动将: 跳过证书验证(allowInsecure) 设置为 true, 或打开: 允许不安全的连接${PLAIN}\n"
 }
 
 add_config() {
@@ -163,43 +242,86 @@ add_config() {
     echo -e " 5) VLESS-WS (Argo)\n"
     read -p "请选择 [1-5]: " proto_idx
 
+    case "$proto_idx" in
+        1|2|3|4|5) ;;
+        *) echo "输入错误"; sleep 1; return ;;
+    esac
+
     load_secrets
-    PORT=$(rand_port)
-    UUID=$GLOBAL_UUID
+    DEF_PORT=$(rand_port)
     
     case "$proto_idx" in
         1)
+            read -p "请输入监听端口 [默认随机: $DEF_PORT]: " PORT
+            PORT=${PORT:-$DEF_PORT}
+            
+            read -p "请输入UUID(回车默认随机): " input_uuid
+            UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
+            echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
+            
             TAG="VLESS-REALITY-$PORT"
             read -p "伪装域名 [默认: apple.com]: " SNI
             SNI=${SNI:-apple.com}
-            KEYS=$(sing-box generate reality-keypair)
+            KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
             PK=$(echo "$KEYS" | grep PrivateKey | awk '{print $2}')
             PUB=$(echo "$KEYS" | grep PublicKey | awk '{print $2}')
-            SID=$(sing-box generate rand --hex 8)
+            SID=$(/usr/local/bin/sing-box generate rand --hex 8)
             save_secret "REALITY_PUB_${PORT}" "$PUB"
             
             jq --argjson p "$PORT" --arg uuid "$UUID" --arg sni "$SNI" --arg pk "$PK" --arg sid "$SID" --arg tag "$TAG" \
-            '.inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"flow":"xtls-rpxr-vision"}],"tls":{"enabled":true,"server_name":$sni,"reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            '.inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sni,"reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         2)
+            read -p "请输入 Hysteria2 监听端口 (UDP) [默认随机: $DEF_PORT]: " PORT
+            PORT=${PORT:-$DEF_PORT}
+            
+            read -p "请输入密码(回车默认随机): " input_pass
+            PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
+            echo -e "密码: ${GREEN}${PASS}${PLAIN}"
+            
             TAG="Hysteria2-$PORT"
             check_cert
-            jq --argjson p "$PORT" --arg pass "$UUID" --arg domain "$DOMAIN" --arg tag "$TAG" \
-            '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            jq --argjson p "$PORT" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
+            '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         3)
+            read -p "请输入 TUIC 监听端口 (UDP) [默认随机: $DEF_PORT]: " PORT
+            PORT=${PORT:-$DEF_PORT}
+            
+            read -p "请输入UUID(回车默认随机): " input_uuid
+            UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
+            echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
+            
+            read -p "请输入密码(回车默认随机): " input_pass
+            PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
+            echo -e "密码: ${GREEN}${PASS}${PLAIN}"
+            
             TAG="TUIC-$PORT"
             check_cert
-            jq --argjson p "$PORT" --arg pass "$UUID" --arg domain "$DOMAIN" --arg tag "$TAG" \
-            '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$pass,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            jq --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
+            '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         4)
+            read -p "请输入 AnyTLS 监听端口 (TCP) [默认随机: $DEF_PORT]: " PORT
+            PORT=${PORT:-$DEF_PORT}
+            
+            read -p "请输入密码(回车默认随机): " input_pass
+            PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
+            echo -e "密码: ${GREEN}${PASS}${PLAIN}"
+            
             TAG="AnyTLS-$PORT"
             check_cert
-            jq --argjson p "$PORT" --arg pass "$UUID" --arg domain "$DOMAIN" --arg tag "$TAG" \
-            '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            jq --argjson p "$PORT" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
+            '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         5)
+            read -p "请输入本地监听端口 [默认随机: $DEF_PORT]: " PORT
+            PORT=${PORT:-$DEF_PORT}
+            
+            read -p "请输入UUID(回车默认随机): " input_uuid
+            UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
+            echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
+            
             TAG="Argo-WS-$PORT"
             read -p "Argo 优选域名/IP [默认: icook.hk]: " ARGO_IP
             ARGO_IP=${ARGO_IP:-icook.hk}
@@ -209,7 +331,7 @@ add_config() {
             save_secret "ARGO_DOMAIN_${PORT}" "$ARGO_DOMAIN"
             
             jq --argjson p "$PORT" --arg uuid "$UUID" --arg tag "$TAG" \
-            '.inbounds += [{"type":"vless","tag":$tag,"listen":"localhost","listen_port":$p,"users":[{"uuid":$uuid}],"transport":{"type":"ws","path":"/argo"}}]' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+            '.inbounds += [{"type":"vless","tag":$tag,"listen":"localhost","listen_port":$p,"users":[{"uuid":$uuid}],"transport":{"type":"ws","path":"/argo"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             
             if ! command -v cloudflared &> /dev/null; then
                 ARCH=$(uname -m)
@@ -242,12 +364,12 @@ EOF
                 cloudflared service install "${ARGO_TOKEN}"
             fi
             ;;
-        *) echo "输入错误"; sleep 1; return ;;
     esac
     
     restart_service
-    echo -e "${GREEN}已添加配置: ${TAG}${PLAIN}"
-    sleep 2
+    echo -e "${GREEN}配置已添加并生效！${PLAIN}"
+    print_config_detail "$TAG"
+    read -p "按回车键返回菜单..."
 }
 
 list_inbounds() {
@@ -277,25 +399,61 @@ modify_config() {
     OLD_PORT=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .listen_port' $CONFIG_FILE)
 
     echo -e "\n当前选中: ${YELLOW}$TAG${PLAIN}"
-    echo -e " 1) 随机生成新的 UUID/密码"
-    echo -e " 2) 自定义输入 UUID/密码"
-    echo -e " 3) 更改端口"
-    echo -e " 0) 返回"
-    echo ""
-    read -p "请选择 [0-3]: " mod_idx
+    
+    # 根据协议动态展示菜单
+    if [ "$TYPE" == "vless" ]; then
+        echo -e " 1) 更改 UUID"
+        echo -e " 2) 更改端口"
+        echo -e " 0) 返回"
+        read -p "请选择 [0-2]: " mod_idx
+        if [ "$mod_idx" == "1" ]; then action="uuid"
+        elif [ "$mod_idx" == "2" ]; then action="port"
+        else return; fi
+    elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "anytls" ]]; then
+        echo -e " 1) 更改密码"
+        echo -e " 2) 更改端口"
+        echo -e " 0) 返回"
+        read -p "请选择 [0-2]: " mod_idx
+        if [ "$mod_idx" == "1" ]; then action="pass"
+        elif [ "$mod_idx" == "2" ]; then action="port"
+        else return; fi
+    elif [ "$TYPE" == "tuic" ]; then
+        echo -e " 1) 更改 UUID"
+        echo -e " 2) 更改密码"
+        echo -e " 3) 更改端口"
+        echo -e " 0) 返回"
+        read -p "请选择 [0-3]: " mod_idx
+        if [ "$mod_idx" == "1" ]; then action="uuid"
+        elif [ "$mod_idx" == "2" ]; then action="pass"
+        elif [ "$mod_idx" == "3" ]; then action="port"
+        else return; fi
+    else
+        echo "未知的协议类型"
+        sleep 1; return
+    fi
 
-    if [ "$mod_idx" == "1" ]; then
-        NEW_AUTH=$(sing-box generate uuid)
-        echo -e "已生成新凭据: ${GREEN}$NEW_AUTH${PLAIN}"
-    elif [ "$mod_idx" == "2" ]; then
-        read -p "请输入新的 UUID 或 密码: " NEW_AUTH
-        if [ -z "$NEW_AUTH" ]; then echo "输入不能为空!"; sleep 1; return; fi
-    elif [ "$mod_idx" == "3" ]; then
+    if [ "$action" == "uuid" ]; then
+        read -p "请输入UUID(回车默认随机): " input_uuid
+        NEW_AUTH=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
+        echo -e "UUID: ${GREEN}${NEW_AUTH}${PLAIN}"
+        jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid) = "'$NEW_AUTH'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
+        restart_service
+        echo -e "${GREEN}节点 $TAG 的 UUID 已更新！${PLAIN}"
+        sleep 2
+    elif [ "$action" == "pass" ]; then
+        read -p "请输入密码(回车默认随机): " input_pass
+        NEW_AUTH=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
+        echo -e "密码: ${GREEN}${NEW_AUTH}${PLAIN}"
+        jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].password) = "'$NEW_AUTH'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
+        restart_service
+        echo -e "${GREEN}节点 $TAG 的密码已更新！${PLAIN}"
+        sleep 2
+    elif [ "$action" == "port" ]; then
         NEW_PORT=$(rand_port)
-        read -p "请输入新端口 [默认: $NEW_PORT]: " input_port
+        read -p "请输入新端口 [默认随机: $NEW_PORT]: " input_port
         NEW_PORT=${input_port:-$NEW_PORT}
         
-        jq '(.inbounds[] | select(.tag=="'$TAG'") | .listen_port) = '$NEW_PORT'' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        jq '(.inbounds[] | select(.tag=="'$TAG'") | .listen_port) = '$NEW_PORT'' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
         
         load_secrets
         if [[ "$TAG" == *"REALITY"* ]]; then
@@ -309,31 +467,13 @@ modify_config() {
         fi
         
         NEW_TAG=$(echo "$TAG" | sed "s/-$OLD_PORT/-$NEW_PORT/")
-        jq '(.inbounds[] | select(.tag=="'$TAG'") | .tag) = "'$NEW_TAG'"' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+        jq '(.inbounds[] | select(.tag=="'$TAG'") | .tag) = "'$NEW_TAG'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
         TAG=$NEW_TAG
         echo -e "${GREEN}端口已更改为: $NEW_PORT${PLAIN}"
-    else
-        return
+        restart_service
+        echo -e "${GREEN}节点 $TAG 的配置已生效！${PLAIN}"
+        sleep 2
     fi
-
-    if [ "$mod_idx" == "1" ] || [ "$mod_idx" == "2" ]; then
-        case "$TYPE" in
-            vless)
-                jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid) = "'$NEW_AUTH'"' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
-                ;;
-            hysteria2|anytls)
-                jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].password) = "'$NEW_AUTH'"' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
-                ;;
-            tuic)
-                jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid) = "'$NEW_AUTH'" | (.inbounds[] | select(.tag=="'$TAG'") | .users[0].password) = "'$NEW_AUTH'"' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
-                ;;
-        esac
-        echo -e "${GREEN}凭据已成功更新！${PLAIN}"
-    fi
-
-    restart_service
-    echo -e "${GREEN}节点 $TAG 的配置已生效！${PLAIN}"
-    sleep 2
 }
 
 del_config() {
@@ -346,7 +486,7 @@ del_config() {
     TAG=${TAGS[$idx]}
     if [ -z "$TAG" ]; then echo "输入错误!"; sleep 1; return; fi
     
-    jq 'del(.inbounds[] | select(.tag == "'$TAG'"))' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
+    jq 'del(.inbounds[] | select(.tag == "'$TAG'"))' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
     if [[ "$TAG" == *"Argo"* ]]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service cloudflared stop 2>/dev/null
@@ -371,48 +511,7 @@ view_single_config() {
     TAG=${TAGS[$idx]}
     if [ -z "$TAG" ]; then echo "输入错误!"; sleep 1; return; fi
     
-    IP=$(get_ip)
-    load_secrets
-    TYPE=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .type' $CONFIG_FILE)
-    PORT=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .listen_port' $CONFIG_FILE)
-    
-    echo -e "\n-------------- ${YELLOW}$TAG${PLAIN} -------------"
-    echo "协议 (protocol)       = $TYPE"
-    if [[ "$TAG" == *"Argo"* ]]; then
-        echo "监听地址 (listen)     = localhost"
-    fi
-    echo "监听端口 (port)       = $PORT"
-    
-    echo -e "------------- 链接 (URL) -------------"
-    case "$TYPE" in
-        vless)
-            AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
-            if [[ "$TAG" == *"REALITY"* ]]; then
-                SNI=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.server_name' $CONFIG_FILE)
-                SID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.short_id[0]' $CONFIG_FILE)
-                PUB=$(eval echo \$REALITY_PUB_${PORT})
-                echo "vless://${AUTH}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-            elif [[ "$TAG" == *"Argo"* ]]; then
-                A_IP=$(eval echo \$ARGO_IP_${PORT})
-                A_DOM=$(eval echo \$ARGO_DOMAIN_${PORT})
-                echo "vless://${AUTH}@${A_IP}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
-            fi
-            ;;
-        hysteria2)
-            AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-            echo "hysteria2://${AUTH}@${DOMAIN}:${PORT}?security=tls&alpn=h3&insecure=0&allowInsecure=0&sni=${DOMAIN}#${TAG}"
-            ;;
-        tuic)
-            T_UUID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
-            T_PASS=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-            echo "tuic://${T_UUID}:${T_PASS}@${DOMAIN}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&insecure=0&allowInsecure=0#${TAG}"
-            ;;
-        anytls)
-            AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-            echo "anytls://${AUTH}@${DOMAIN}:${PORT}?sni=${DOMAIN}&allowInsecure=0&insecure=0#${TAG}"
-            ;;
-    esac
-    echo -e "------------- END -------------"
+    print_config_detail "$TAG"
     read -p "按回车键返回菜单..."
 }
 
@@ -517,6 +616,7 @@ uninstall_all() {
         fi
         
         rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb $CONFIG_DIR
+        rm -f $TMP_JSON
         echo -e "${GREEN}已彻底卸载！${PLAIN}"
         exit 0
     fi
