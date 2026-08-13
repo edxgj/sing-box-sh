@@ -1,4 +1,3 @@
-cat > sb.sh << 'EOF' && bash sb.sh
 #!/bin/bash
 
 RED='\033[0;31m'
