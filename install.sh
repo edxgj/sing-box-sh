@@ -46,7 +46,7 @@ load_secrets() {
 }
 
 init_base() {
-    if ! command -v jq &> /dev/null || ! command -v sing-box &> /dev/null; then
+    if ! command -v jq &> /dev/null || [ ! -f "/usr/local/bin/sing-box" ]; then
         echo -e "${CYAN}==> 正在安装必要环境与内核...${PLAIN}"
         if [ "$OS_TYPE" == "alpine" ]; then
             apk update >/dev/null 2>&1
@@ -81,7 +81,7 @@ init_base() {
     
     load_secrets
     if [ -z "$GLOBAL_UUID" ]; then
-        GLOBAL_UUID=$(sing-box generate uuid)
+        GLOBAL_UUID=$(/usr/local/bin/sing-box generate uuid)
         save_secret "GLOBAL_UUID" "$GLOBAL_UUID"
     fi
 }
@@ -112,7 +112,7 @@ check_cert() {
 }
 
 restart_service() {
-    if ! sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
+    if ! /usr/local/bin/sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
         echo -e "${RED}配置文件校验失败，请检查！${PLAIN}"
         return 1
     fi
@@ -171,10 +171,10 @@ add_config() {
             TAG="VLESS-REALITY-$PORT"
             read -p "伪装域名 [默认: apple.com]: " SNI
             SNI=${SNI:-apple.com}
-            KEYS=$(sing-box generate reality-keypair)
+            KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
             PK=$(echo "$KEYS" | grep PrivateKey | awk '{print $2}')
             PUB=$(echo "$KEYS" | grep PublicKey | awk '{print $2}')
-            SID=$(sing-box generate rand --hex 8)
+            SID=$(/usr/local/bin/sing-box generate rand --hex 8)
             save_secret "REALITY_PUB_${PORT}" "$PUB"
             
             jq --argjson p "$PORT" --arg uuid "$UUID" --arg sni "$SNI" --arg pk "$PK" --arg sid "$SID" --arg tag "$TAG" \
@@ -284,7 +284,7 @@ modify_config() {
     read -p "请选择 [0-3]: " mod_idx
 
     if [ "$mod_idx" == "1" ]; then
-        NEW_AUTH=$(sing-box generate uuid)
+        NEW_AUTH=$(/usr/local/bin/sing-box generate uuid)
         echo -e "已生成新凭据: ${GREEN}$NEW_AUTH${PLAIN}"
     elif [ "$mod_idx" == "2" ]; then
         read -p "请输入新的 UUID 或 密码: " NEW_AUTH
@@ -569,4 +569,3 @@ menu() {
 }
 
 menu
-EOF
