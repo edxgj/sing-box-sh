@@ -12,6 +12,12 @@ CONFIG_FILE="$CONFIG_DIR/config.json"
 CERT_DIR="$CONFIG_DIR/cert"
 SECRETS_FILE="$CONFIG_DIR/.secrets"
 
+if [ -f /etc/alpine-release ]; then
+    OS_TYPE="alpine"
+else
+    OS_TYPE="debian"
+fi
+
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}错误: 必须以 root 身份运行本脚本！${PLAIN}"
     exit 1
@@ -43,10 +49,16 @@ load_secrets() {
 init_base() {
     if ! command -v jq &> /dev/null || ! command -v sing-box &> /dev/null; then
         echo -e "${CYAN}==> 正在安装必要环境与内核...${PLAIN}"
-        apt-get update -y >/dev/null 2>&1
-        apt-get install -y curl wget jq tar openssl socat cron systemd nano >/dev/null 2>&1
+        if [ "$OS_TYPE" == "alpine" ]; then
+            apk update >/dev/null 2>&1
+            apk add curl wget jq tar openssl socat bash nano libc6-compat gcompat >/dev/null 2>&1
+            rc-update add crond default >/dev/null 2>&1
+            rc-service crond start >/dev/null 2>&1
+        else
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y curl wget jq tar openssl socat cron systemd nano >/dev/null 2>&1
+        fi
         
-        # 获取系统架构
         ARCH=$(uname -m)
         case "$ARCH" in
             x86_64) SB_ARCH="amd64" ;;
@@ -90,7 +102,13 @@ check_cert() {
     curl https://get.acme.sh | sh
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
     ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${DOMAIN}
-    ~/.acme.sh/acme.sh --installcert -d ${DOMAIN} --fullchainpath $CERT_DIR/fullchain.cer --keypath $CERT_DIR/private.key --reloadcmd "systemctl restart sing-box"
+    
+    if [ "$OS_TYPE" == "alpine" ]; then
+        RELOAD_CMD="rc-service sing-box restart"
+    else
+        RELOAD_CMD="systemctl restart sing-box"
+    fi
+    ~/.acme.sh/acme.sh --installcert -d ${DOMAIN} --fullchainpath $CERT_DIR/fullchain.cer --keypath $CERT_DIR/private.key --reloadcmd "$RELOAD_CMD"
     chmod -R 755 $CERT_DIR
 }
 
@@ -99,9 +117,39 @@ restart_service() {
         echo -e "${RED}配置文件校验失败，请检查！${PLAIN}"
         return 1
     fi
-    systemctl daemon-reload
-    systemctl enable sing-box --now >/dev/null 2>&1
-    systemctl restart sing-box
+    
+    if [ "$OS_TYPE" == "alpine" ]; then
+        cat > /etc/init.d/sing-box << 'EOF'
+#!/sbin/openrc-run
+name="sing-box"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_background=true
+pidfile="/var/run/sing-box.pid"
+depend() {
+    need net
+}
+EOF
+        chmod +x /etc/init.d/sing-box
+        rc-update add sing-box default >/dev/null 2>&1
+        rc-service sing-box restart
+    else
+        cat > /etc/systemd/system/sing-box.service << 'EOF'
+[Unit]
+Description=sing-box service
+After=network.target
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable sing-box --now >/dev/null 2>&1
+        systemctl restart sing-box
+    fi
     echo -e "${GREEN}服务已重启并生效！${PLAIN}"
 }
 
@@ -170,11 +218,29 @@ add_config() {
                     aarch64|arm64) CF_ARCH="arm64" ;;
                     *) CF_ARCH="amd64" ;;
                 esac
-                curl -L -o cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}.deb"
-                dpkg -i cloudflared.deb && rm -f cloudflared.deb
+                curl -L -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+                chmod +x /usr/local/bin/cloudflared
             fi
-            cloudflared service uninstall 2>/dev/null
-            cloudflared service install "${ARGO_TOKEN}"
+            
+            if [ "$OS_TYPE" == "alpine" ]; then
+                cat > /etc/init.d/cloudflared << EOF
+#!/sbin/openrc-run
+name="cloudflared"
+command="/usr/local/bin/cloudflared"
+command_args="tunnel --no-autoupdate run --token ${ARGO_TOKEN}"
+command_background=true
+pidfile="/var/run/cloudflared.pid"
+depend() {
+    need net
+}
+EOF
+                chmod +x /etc/init.d/cloudflared
+                rc-update add cloudflared default >/dev/null 2>&1
+                rc-service cloudflared restart
+            else
+                cloudflared service uninstall 2>/dev/null
+                cloudflared service install "${ARGO_TOKEN}"
+            fi
             ;;
         *) echo "输入错误"; sleep 1; return ;;
     esac
@@ -282,7 +348,13 @@ del_config() {
     
     jq 'del(.inbounds[] | select(.tag == "'$TAG'"))' $CONFIG_FILE > tmp.json && mv tmp.json $CONFIG_FILE
     if [[ "$TAG" == *"Argo"* ]]; then
-        cloudflared service uninstall 2>/dev/null
+        if [ "$OS_TYPE" == "alpine" ]; then
+            rc-service cloudflared stop 2>/dev/null
+            rc-update del cloudflared default 2>/dev/null
+            rm -f /etc/init.d/cloudflared
+        else
+            cloudflared service uninstall 2>/dev/null
+        fi
     fi
     restart_service
     echo -e "${GREEN}配置 $TAG 已删除！${PLAIN}"
@@ -412,8 +484,12 @@ run_manage() {
     echo "3) 重启"
     read -p "请选择 [1-3]: " run_idx
     case "$run_idx" in
-        1) systemctl start sing-box; echo "已启动"; sleep 1 ;;
-        2) systemctl stop sing-box; echo "已停止"; sleep 1 ;;
+        1) 
+           if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box start; else systemctl start sing-box; fi
+           echo "已启动"; sleep 1 ;;
+        2) 
+           if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box stop; else systemctl stop sing-box; fi
+           echo "已停止"; sleep 1 ;;
         3) restart_service; sleep 1 ;;
     esac
 }
@@ -421,10 +497,26 @@ run_manage() {
 uninstall_all() {
     read -p "确认卸载? (y/n): " un
     if [[ "$un" == "y" ]]; then
-        systemctl stop sing-box cloudflared 2>/dev/null
-        systemctl disable sing-box cloudflared 2>/dev/null
-        rm -rf /etc/systemd/system/sing-box.service /usr/local/bin/sing-box /usr/local/bin/sb $CONFIG_DIR
-        cloudflared service uninstall 2>/dev/null
+        if [ "$OS_TYPE" == "alpine" ]; then
+            rc-service sing-box stop 2>/dev/null
+            rc-service cloudflared stop 2>/dev/null
+            rc-update del sing-box default 2>/dev/null
+            rc-update del cloudflared default 2>/dev/null
+            rm -f /etc/init.d/sing-box /etc/init.d/cloudflared
+        else
+            systemctl stop sing-box cloudflared 2>/dev/null
+            systemctl disable sing-box cloudflared 2>/dev/null
+            rm -rf /etc/systemd/system/sing-box.service
+            cloudflared service uninstall 2>/dev/null
+            systemctl daemon-reload
+        fi
+        
+        if [ -f "$HOME/.acme.sh/acme.sh" ]; then
+            $HOME/.acme.sh/acme.sh --uninstall
+            rm -rf $HOME/.acme.sh
+        fi
+        
+        rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb $CONFIG_DIR
         echo -e "${GREEN}已彻底卸载！${PLAIN}"
         exit 0
     fi
@@ -434,12 +526,17 @@ menu() {
     init_base
     while true; do
         clear
-        SB_STATUS=$(systemctl is-active sing-box 2>/dev/null)
+        if [ "$OS_TYPE" == "alpine" ]; then
+            SB_STATUS=$(rc-service sing-box status 2>/dev/null | grep -o 'started')
+            [ "$SB_STATUS" == "started" ] && SB_STATUS="active" || SB_STATUS="stopped"
+        else
+            SB_STATUS=$(systemctl is-active sing-box 2>/dev/null)
+        fi
         [ "$SB_STATUS" == "active" ] && ST_COLOR=$GREEN || ST_COLOR=$RED
         VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
         
         echo -e "------------- sing-box 综合管理脚本 -------------"
-        echo -e "sing-box ${VER:-未安装}: ${ST_COLOR}${SB_STATUS:-stopped}${PLAIN}"
+        echo -e "sing-box ${VER:-未安装}: ${ST_COLOR}${SB_STATUS}${PLAIN}"
         echo -e ""
         echo -e " 1) 添加配置"
         echo -e " 2) 更改配置"
