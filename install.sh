@@ -24,8 +24,8 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 if [[ "$0" != "/usr/local/bin/sb" ]]; then
-    cp -f "$0" /usr/local/bin/sb 2>/dev/null
-    chmod +x /usr/local/bin/sb 2>/dev/null
+    curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
+    chmod +x /usr/local/bin/sb
     rm -f sb.sh install.sh 2>/dev/null
 fi
 
@@ -82,11 +82,81 @@ init_base() {
     fi
 }
 
+cert_manage() {
+    clear
+    echo -e "选择: 证书管理\n"
+    echo -e " 1) 申请新证书 (覆盖当前)"
+    echo -e " 2) 手动强制续期"
+    echo -e " 3) 查看证书与自动续期状态"
+    echo -e " 0) 返回"
+    echo ""
+    read -p "请选择 [0-3]: " cert_idx
+
+    load_secrets
+    case "$cert_idx" in
+        1)
+            echo -e "${YELLOW}注意: 申请证书需要域名已成功解析到本机 IP！${PLAIN}"
+            read -p "请输入你的域名 (如 node.domain.com): " NEW_DOMAIN
+            read -p "请输入 Cloudflare 邮箱: " NEW_CF_Email
+            read -p "请输入 Cloudflare Global API Key: " NEW_CF_Key
+            
+            save_secret "DOMAIN" "$NEW_DOMAIN"
+            export CF_Key="${NEW_CF_Key}"
+            export CF_Email="${NEW_CF_Email}"
+            
+            curl -sL https://get.acme.sh | sh
+            ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+            ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${NEW_DOMAIN} --force
+            
+            if [ "$OS_TYPE" == "alpine" ]; then
+                RELOAD_CMD="rc-service sing-box restart"
+            else
+                RELOAD_CMD="systemctl restart sing-box"
+            fi
+            ~/.acme.sh/acme.sh --installcert -d ${NEW_DOMAIN} --fullchainpath $CERT_DIR/fullchain.cer --keypath $CERT_DIR/private.key --reloadcmd "$RELOAD_CMD"
+            chmod -R 755 $CERT_DIR
+            echo -e "${GREEN}证书申请并安装完成！(acme.sh 已自动配置系统定时续期任务)${PLAIN}"
+            sleep 2
+            ;;
+        2)
+            if [ -z "$DOMAIN" ] || [ ! -f "$CERT_DIR/fullchain.cer" ]; then
+                echo -e "${RED}未找到已申请的证书记录，请先执行申请证书！${PLAIN}"
+                sleep 2; return
+            fi
+            echo -e "${CYAN}正在强制续期证书: $DOMAIN ...${PLAIN}"
+            ~/.acme.sh/acme.sh --renew -d ${DOMAIN} --force
+            echo -e "${GREEN}手动续期执行完毕！${PLAIN}"
+            sleep 2
+            ;;
+        3)
+            echo -e "\n------------- 证书信息 -------------"
+            if [ -f "$CERT_DIR/fullchain.cer" ]; then
+                echo -e "绑定的域名\t: ${GREEN}${DOMAIN}${PLAIN}"
+                echo -e "证书路径\t: ${GREEN}$CERT_DIR/fullchain.cer${PLAIN}"
+                echo -e "私钥路径\t: ${GREEN}$CERT_DIR/private.key${PLAIN}"
+                echo -e "\n------------- 自动续期 -------------"
+                if crontab -l 2>/dev/null | grep -q "acme.sh"; then
+                    echo -e "${GREEN}acme.sh 自动续期定时任务已正常运行中！${PLAIN}"
+                    crontab -l | grep "acme.sh"
+                else
+                    echo -e "${RED}警告: 未发现 acme.sh 自动续期定时任务！${PLAIN}"
+                fi
+            else
+                echo -e "${YELLOW}当前未安装任何真实域名证书。${PLAIN}"
+            fi
+            echo -e "------------------------------------"
+            read -p "按回车键返回菜单..."
+            ;;
+        0) return ;;
+        *) echo "输入错误!"; sleep 1 ;;
+    esac
+}
+
 check_cert() {
     load_secrets
     if [ -f "$CERT_DIR/fullchain.cer" ] && [ -f "$CERT_DIR/private.key" ]; then return 0; fi
     
-    echo -e "${YELLOW}此协议需要真实域名和SSL证书！${PLAIN}"
+    echo -e "${YELLOW}当前节点协议需要真实域名和SSL证书！准备自动调用证书申请...${PLAIN}"
     read -p "请输入你的域名 (如 node.domain.com): " DOMAIN
     read -p "请输入 Cloudflare 邮箱: " CF_Email
     read -p "请输入 Cloudflare Global API Key: " CF_Key
@@ -94,7 +164,7 @@ check_cert() {
 
     export CF_Key="${CF_Key}"
     export CF_Email="${CF_Email}"
-    curl https://get.acme.sh | sh
+    curl -sL https://get.acme.sh | sh
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
     ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${DOMAIN}
     
@@ -400,7 +470,6 @@ modify_config() {
 
     echo -e "\n当前选中: ${YELLOW}$TAG${PLAIN}"
     
-    # 根据协议动态展示菜单
     if [ "$TYPE" == "vless" ]; then
         echo -e " 1) 更改 UUID"
         echo -e " 2) 更改端口"
@@ -446,7 +515,7 @@ modify_config() {
         echo -e "密码: ${GREEN}${NEW_AUTH}${PLAIN}"
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].password) = "'$NEW_AUTH'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
         restart_service
-        echo -e "${GREEN}节点 $TAG 的密码已更新！${PLAIN}"
+        echo -e "${GREEN}节点 $TAG 的密码 已更新！${PLAIN}"
         sleep 2
     elif [ "$action" == "port" ]; then
         NEW_PORT=$(rand_port)
@@ -642,27 +711,29 @@ menu() {
         echo -e " 2) 更改配置"
         echo -e " 3) 删除配置"
         echo -e " 4) 查看配置"
-        echo -e " 5) 运行管理"
-        echo -e " 6) 更新内核"
-        echo -e " 7) 卸载"
+        echo -e " 5) 证书管理"
+        echo -e " 6) 运行管理"
+        echo -e " 7) 更新内核"
+        echo -e " 8) 卸载"
         echo -e " 0) 退出"
         echo -e ""
-        read -p "请选择 [0-7]: " choice
+        read -p "请选择 [0-8]: " choice
 
         case "$choice" in
             1) add_config ;;
             2) modify_config ;;
             3) del_config ;;
             4) view_config ;;
-            5) run_manage ;;
-            6) 
+            5) cert_manage ;;
+            6) run_manage ;;
+            7) 
                echo "正在更新内核..."
                rm -f /usr/local/bin/sing-box
                init_base
                restart_service
                sleep 2
                ;;
-            7) uninstall_all ;;
+            8) uninstall_all ;;
             0) exit 0 ;;
             *) echo "输入错误!"; sleep 1 ;;
         esac
