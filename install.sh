@@ -22,8 +22,9 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [ ! -f "/usr/local/bin/sb" ] || ! cmp -s "$0" "/usr/local/bin/sb"; then
-    cp "$0" /usr/local/bin/sb
+# 核心修复：防止读取 $0 导致 bash 管道中断
+if [[ "$0" == *"bash"* ]] || [[ "$0" == *"/dev/fd/"* ]] || [ ! -f "/usr/local/bin/sb" ]; then
+    curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
     chmod +x /usr/local/bin/sb
 fi
 
@@ -46,7 +47,7 @@ load_secrets() {
 }
 
 init_base() {
-    if ! command -v jq &> /dev/null || [ ! -f "/usr/local/bin/sing-box" ]; then
+    if ! command -v jq &> /dev/null || ! command -v sing-box &> /dev/null; then
         echo -e "${CYAN}==> 正在安装必要环境与内核...${PLAIN}"
         if [ "$OS_TYPE" == "alpine" ]; then
             apk update >/dev/null 2>&1
@@ -81,7 +82,7 @@ init_base() {
     
     load_secrets
     if [ -z "$GLOBAL_UUID" ]; then
-        GLOBAL_UUID=$(/usr/local/bin/sing-box generate uuid)
+        GLOBAL_UUID=$(sing-box generate uuid)
         save_secret "GLOBAL_UUID" "$GLOBAL_UUID"
     fi
 }
@@ -112,7 +113,7 @@ check_cert() {
 }
 
 restart_service() {
-    if ! /usr/local/bin/sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
+    if ! sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
         echo -e "${RED}配置文件校验失败，请检查！${PLAIN}"
         return 1
     fi
@@ -171,10 +172,10 @@ add_config() {
             TAG="VLESS-REALITY-$PORT"
             read -p "伪装域名 [默认: apple.com]: " SNI
             SNI=${SNI:-apple.com}
-            KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
+            KEYS=$(sing-box generate reality-keypair)
             PK=$(echo "$KEYS" | grep PrivateKey | awk '{print $2}')
             PUB=$(echo "$KEYS" | grep PublicKey | awk '{print $2}')
-            SID=$(/usr/local/bin/sing-box generate rand --hex 8)
+            SID=$(sing-box generate rand --hex 8)
             save_secret "REALITY_PUB_${PORT}" "$PUB"
             
             jq --argjson p "$PORT" --arg uuid "$UUID" --arg sni "$SNI" --arg pk "$PK" --arg sid "$SID" --arg tag "$TAG" \
@@ -284,7 +285,7 @@ modify_config() {
     read -p "请选择 [0-3]: " mod_idx
 
     if [ "$mod_idx" == "1" ]; then
-        NEW_AUTH=$(/usr/local/bin/sing-box generate uuid)
+        NEW_AUTH=$(sing-box generate uuid)
         echo -e "已生成新凭据: ${GREEN}$NEW_AUTH${PLAIN}"
     elif [ "$mod_idx" == "2" ]; then
         read -p "请输入新的 UUID 或 密码: " NEW_AUTH
@@ -532,7 +533,7 @@ menu() {
             SB_STATUS=$(systemctl is-active sing-box 2>/dev/null)
         fi
         [ "$SB_STATUS" == "active" ] && ST_COLOR=$GREEN || ST_COLOR=$RED
-        VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        VER=$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
         
         echo -e "------------- sing-box 综合管理脚本 -------------"
         echo -e "sing-box ${VER:-未安装}: ${ST_COLOR}${SB_STATUS}${PLAIN}"
