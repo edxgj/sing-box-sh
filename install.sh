@@ -23,12 +23,6 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ "$0" != "/usr/local/bin/sb" ]]; then
-    curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
-    chmod +x /usr/local/bin/sb
-    rm -f sb.sh install.sh 2>/dev/null
-fi
-
 rand_port() { shuf -i 10000-65000 -n 1; }
 
 get_ip() { curl -s ipv4.icanhazip.com; }
@@ -783,8 +777,7 @@ show_all_links() {
 view_config() {
     clear
     echo -e "选择: 查看配置\n"
-    echo -e " 1) 单协议链接"
-    echo -e " 2) 聚合链接"
+    echo -e " 1) 单协议链接                                  2) 聚合链接"
     echo -e " 0) 返回"
     echo ""
     read -p "请选择 [0-2]: " v_idx
@@ -891,7 +884,7 @@ update_manage() {
 }
 
 uninstall_all() {
-    read -p "确认删除卸载脚本,sing-box,节点配置吗？(y/n): " un
+    read -p "确认卸载sing-box和删除所有节点配置吗？(y/n): " un
     if [[ "$un" == "y" ]]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service sing-box stop 2>/dev/null
