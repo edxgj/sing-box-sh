@@ -554,6 +554,7 @@ select_inbound() {
     TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' $CONFIG_FILE))
     if [ ${#TAGS[@]} -eq 0 ]; then
         echo -e "${RED}当前没有发现任何配置！${PLAIN}"
+        sleep 2
         return 1
     fi
     for i in "${!TAGS[@]}"; do
@@ -777,31 +778,46 @@ modify_config() {
     echo -e "\n当前选中: ${YELLOW}$TAG${PLAIN}"
     
     if [ "$TYPE" == "vless" ]; then
-        echo -e " 1) 更改 UUID\t\t2) 更改端口"
-        echo -e " 3) 更改节点名称\t0) 返回"
+        echo -e " 1) 更改 UUID"
+        echo -e " 2) 更改端口"
+        echo -e " 3) 更改节点名称"
+        echo -e " 0) 返回"
         read -p "请选择 [0-3]: " mod_idx
-        if [ "$mod_idx" == "1" ]; then action="uuid"
-        elif [ "$mod_idx" == "2" ]; then action="port"
-        elif [ "$mod_idx" == "3" ]; then action="tag"
-        else return; fi
+        case "$mod_idx" in
+            1) action="uuid" ;;
+            2) action="port" ;;
+            3) action="tag" ;;
+            0) return ;;
+            *) echo "输入错误!"; sleep 1; return ;;
+        esac
     elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "anytls" ]]; then
-        echo -e " 1) 更改密码\t\t2) 更改端口"
-        echo -e " 3) 更改节点名称\t0) 返回"
+        echo -e " 1) 更改密码"
+        echo -e " 2) 更改端口"
+        echo -e " 3) 更改节点名称"
+        echo -e " 0) 返回"
         read -p "请选择 [0-3]: " mod_idx
-        if [ "$mod_idx" == "1" ]; then action="pass"
-        elif [ "$mod_idx" == "2" ]; then action="port"
-        elif [ "$mod_idx" == "3" ]; then action="tag"
-        else return; fi
+        case "$mod_idx" in
+            1) action="pass" ;;
+            2) action="port" ;;
+            3) action="tag" ;;
+            0) return ;;
+            *) echo "输入错误!"; sleep 1; return ;;
+        esac
     elif [ "$TYPE" == "tuic" ]; then
-        echo -e " 1) 更改 UUID\t\t2) 更改密码"
-        echo -e " 3) 更改端口\t\t4) 更改节点名称"
+        echo -e " 1) 更改 UUID"
+        echo -e " 2) 更改密码"
+        echo -e " 3) 更改端口"
+        echo -e " 4) 更改节点名称"
         echo -e " 0) 返回"
         read -p "请选择 [0-4]: " mod_idx
-        if [ "$mod_idx" == "1" ]; then action="uuid"
-        elif [ "$mod_idx" == "2" ]; then action="pass"
-        elif [ "$mod_idx" == "3" ]; then action="port"
-        elif [ "$mod_idx" == "4" ]; then action="tag"
-        else return; fi
+        case "$mod_idx" in
+            1) action="uuid" ;;
+            2) action="pass" ;;
+            3) action="port" ;;
+            4) action="tag" ;;
+            0) return ;;
+            *) echo "输入错误!"; sleep 1; return ;;
+        esac
     else
         echo "未知的协议类型"
         sleep 1; return
@@ -993,8 +1009,15 @@ show_all_links() {
     echo -e "🚀【 聚合节点 】节点信息如下：\n"
     echo -e "分享链接"
     TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' $CONFIG_FILE))
-    IP=$(get_ip)
     
+    if [ ${#TAGS[@]} -eq 0 ]; then
+        echo -e "\n${RED}当前没有发现任何配置！${PLAIN}"
+        echo -e "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+        sleep 2
+        return
+    fi
+    
+    IP=$(get_ip)
     for TAG in "${TAGS[@]}"; do
         build_share_url "$TAG" "$IP"
     done
@@ -1005,7 +1028,8 @@ show_all_links() {
 view_config() {
     clear
     echo -e "选择: 查看配置\n"
-    echo -e " 1) 单协议链接                                  2) 聚合链接"
+    echo -e " 1) 单协议链接"
+    echo -e " 2) 聚合链接"
     echo -e " 0) 返回"
     echo ""
     read -p "请选择 [0-2]: " v_idx
