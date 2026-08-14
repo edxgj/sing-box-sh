@@ -78,11 +78,9 @@ init_base() {
 
     mkdir -p $CONFIG_DIR $CERT_DIR
     
-    # 修复 sing-box 1.12.0+ geoip 字段被移除导致的内核校验崩溃问题
     if [ ! -f "$CONFIG_FILE" ]; then
         echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > $CONFIG_FILE
     else
-        # 对老版本配置进行热修复替换
         sed -i 's/"geoip":"private"/"ip_is_private":true/g' $CONFIG_FILE
         sed -i 's/"geoip": "private"/"ip_is_private": true/g' $CONFIG_FILE
     fi
@@ -107,6 +105,7 @@ cert_manage() {
             read -p "请输入 Cloudflare Global API Key: " NEW_CF_Key
             
             save_secret "DOMAIN" "$NEW_DOMAIN"
+            save_secret "CERT_TYPE" "real"
             export CF_Key="${NEW_CF_Key}"
             export CF_Email="${NEW_CF_Email}"
             
@@ -138,6 +137,7 @@ cert_manage() {
             echo -e "\n------------- 证书信息 -------------"
             if [ -f "$CERT_DIR/fullchain.cer" ]; then
                 echo -e "绑定的域名\t: ${GREEN}${DOMAIN}${PLAIN}"
+                echo -e "证书类型\t: ${GREEN}${CERT_TYPE:-unknown}${PLAIN}"
                 echo -e "证书路径\t: ${GREEN}$CERT_DIR/fullchain.cer${PLAIN}"
                 echo -e "私钥路径\t: ${GREEN}$CERT_DIR/private.key${PLAIN}"
                 echo -e "\n------------- 自动续期 -------------"
@@ -145,10 +145,10 @@ cert_manage() {
                     echo -e "${GREEN}acme.sh 自动续期定时任务已正常运行中！${PLAIN}"
                     crontab -l | grep "acme.sh"
                 else
-                    echo -e "${RED}警告: 未发现 acme.sh 自动续期定时任务！${PLAIN}"
+                    echo -e "${RED}警告: 未发现 acme.sh 自动续期定时任务 (若您使用的是自签名证书请忽略此警告)！${PLAIN}"
                 fi
             else
-                echo -e "${YELLOW}当前未安装任何真实域名证书。${PLAIN}"
+                echo -e "${YELLOW}当前未安装任何域名证书。${PLAIN}"
             fi
             echo -e "------------------------------------"
             read -p "按回车键返回菜单..."
@@ -162,31 +162,48 @@ check_cert() {
     load_secrets
     if [ -f "$CERT_DIR/fullchain.cer" ] && [ -f "$CERT_DIR/private.key" ]; then return 0; fi
     
-    echo -e "${YELLOW}当前节点协议需要真实域名和SSL证书！准备自动调用证书申请...${PLAIN}"
-    read -p "请输入你的域名 (如 node.domain.com): " DOMAIN
-    read -p "请输入 Cloudflare 邮箱: " CF_Email
-    read -p "请输入 Cloudflare Global API Key: " CF_Key
-    save_secret "DOMAIN" "$DOMAIN"
+    echo -e "${YELLOW}当前节点协议强制需要使用 TLS 加密！${PLAIN}"
+    read -p "是否申请真实域名证书? (y/n) [默认: y]: " apply_cert
+    apply_cert=${apply_cert:-y}
 
-    export CF_Key="${CF_Key}"
-    export CF_Email="${CF_Email}"
-    curl -sL https://get.acme.sh | sh
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${DOMAIN}
-    
-    if [ "$OS_TYPE" == "alpine" ]; then
-        RELOAD_CMD="rc-service sing-box restart"
+    if [[ "$apply_cert" == "y" ]]; then
+        echo -e "${CYAN}准备自动调用证书申请...${PLAIN}"
+        read -p "请输入你的真实域名 (如 node.domain.com): " DOMAIN
+        read -p "请输入 Cloudflare 邮箱: " CF_Email
+        read -p "请输入 Cloudflare Global API Key: " CF_Key
+        save_secret "DOMAIN" "$DOMAIN"
+        save_secret "CERT_TYPE" "real"
+
+        export CF_Key="${CF_Key}"
+        export CF_Email="${CF_Email}"
+        curl -sL https://get.acme.sh | sh
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+        ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${DOMAIN}
+        
+        if [ "$OS_TYPE" == "alpine" ]; then
+            RELOAD_CMD="rc-service sing-box restart"
+        else
+            RELOAD_CMD="systemctl restart sing-box"
+        fi
+        ~/.acme.sh/acme.sh --installcert -d ${DOMAIN} --fullchainpath $CERT_DIR/fullchain.cer --keypath $CERT_DIR/private.key --reloadcmd "$RELOAD_CMD"
+        chmod -R 755 $CERT_DIR
+        echo -e "${GREEN}真实域名证书申请成功！${PLAIN}"
     else
-        RELOAD_CMD="systemctl restart sing-box"
+        echo -e "${CYAN}准备生成自签名证书...${PLAIN}"
+        read -p "请输入伪装域名(SNI) [默认: bing.com]: " DOMAIN
+        DOMAIN=${DOMAIN:-bing.com}
+        save_secret "DOMAIN" "$DOMAIN"
+        save_secret "CERT_TYPE" "self"
+        
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout $CERT_DIR/private.key -out $CERT_DIR/fullchain.cer -subj "/CN=${DOMAIN}" >/dev/null 2>&1
+        chmod -R 755 $CERT_DIR
+        echo -e "${GREEN}自签名证书生成完毕！${PLAIN}"
     fi
-    ~/.acme.sh/acme.sh --installcert -d ${DOMAIN} --fullchainpath $CERT_DIR/fullchain.cer --keypath $CERT_DIR/private.key --reloadcmd "$RELOAD_CMD"
-    chmod -R 755 $CERT_DIR
 }
 
 restart_service() {
     if ! /usr/local/bin/sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
         echo -e "${RED}配置文件校验失败，请检查语法或端口冲突！${PLAIN}"
-        # 输出真实的报错信息方便排查
         /usr/local/bin/sing-box check -c $CONFIG_FILE
         return 1
     fi
@@ -231,6 +248,16 @@ print_config_detail() {
     local IP=$(get_ip)
     load_secrets
     
+    local CONN_ADDR=$IP
+    local INSECURE=1
+    local INSECURE_TEXT="true"
+    
+    if [ "$CERT_TYPE" == "real" ]; then
+        CONN_ADDR=$DOMAIN
+        INSECURE=0
+        INSECURE_TEXT="false"
+    fi
+    
     local TYPE=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .type' $CONFIG_FILE)
     local PORT=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .listen_port' $CONFIG_FILE)
     
@@ -240,7 +267,7 @@ print_config_detail() {
     case "$TYPE" in
         vless)
             local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
-            if [[ "$TAG" == *"REALITY"* ]]; then
+            if [[ "$TAG" == *"REALITY"* || "$TAG" == *"reality"* ]]; then
                 local SNI=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.server_name' $CONFIG_FILE)
                 local SID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.short_id[0]' $CONFIG_FILE)
                 local PUB=$(eval echo \$REALITY_PUB_${PORT})
@@ -254,7 +281,7 @@ print_config_detail() {
                 echo -e "ShortId (sid)\t\t\t= $SID"
                 echo -e "------------- 链接 (URL) -------------"
                 echo "vless://${AUTH}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-            elif [[ "$TAG" == *"Argo"* ]]; then
+            elif [[ "$TAG" == *"Argo"* || "$TAG" == *"argo"* ]]; then
                 local A_IP=$(eval echo \$ARGO_IP_${PORT})
                 local A_DOM=$(eval echo \$ARGO_DOMAIN_${PORT})
                 echo -e "地址 (address)\t\t\t= $A_IP"
@@ -271,44 +298,59 @@ print_config_detail() {
             ;;
         hysteria2)
             local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-            echo -e "地址 (address)\t\t\t= $DOMAIN"
+            echo -e "地址 (address)\t\t\t= $CONN_ADDR"
             echo -e "端口 (port)\t\t\t= $PORT"
             echo -e "密码 (password)\t\t\t= $AUTH"
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "应用层协议协商 (Alpn)\t\t= h3"
-            echo -e "跳过证书验证 (allowInsecure)\t= false"
+            echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
             echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
             echo -e "------------- 链接 (URL) -------------"
-            echo "hysteria2://${AUTH}@${DOMAIN}:${PORT}?security=tls&alpn=h3&insecure=0&allowInsecure=0&sni=${DOMAIN}#${TAG}"
+            echo "hysteria2://${AUTH}@${CONN_ADDR}:${PORT}?security=tls&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}&sni=${DOMAIN}#${TAG}"
             ;;
         tuic)
             local T_UUID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
             local T_PASS=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-            echo -e "地址 (address)\t\t\t= $DOMAIN"
+            echo -e "地址 (address)\t\t\t= $CONN_ADDR"
             echo -e "端口 (port)\t\t\t= $PORT"
             echo -e "用户ID (id)\t\t\t= $T_UUID"
             echo -e "密码 (password)\t\t\t= $T_PASS"
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "应用层协议协商 (Alpn)\t\t= h3"
-            echo -e "跳过证书验证 (allowInsecure)\t= false"
+            echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
             echo -e "拥塞控制算法 (congestion_control)= bbr"
             echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
             echo -e "------------- 链接 (URL) -------------"
-            echo "tuic://${T_UUID}:${T_PASS}@${DOMAIN}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&insecure=0&allowInsecure=0#${TAG}"
+            echo "tuic://${T_UUID}:${T_PASS}@${CONN_ADDR}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&insecure=${INSECURE}&allowInsecure=${INSECURE}#${TAG}"
             ;;
         anytls)
             local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-            echo -e "地址 (address)\t\t\t= $DOMAIN"
+            echo -e "地址 (address)\t\t\t= $CONN_ADDR"
             echo -e "端口 (port)\t\t\t= $PORT"
             echo -e "密码 (password)\t\t\t= $AUTH"
             echo -e "传输层安全 (TLS)\t\t= tls"
-            echo -e "跳过证书验证 (allowInsecure)\t= false"
+            echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
             echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
             echo -e "------------- 链接 (URL) -------------"
-            echo "anytls://${AUTH}@${DOMAIN}:${PORT}?sni=${DOMAIN}&allowInsecure=0&insecure=0#${TAG}"
+            echo "anytls://${AUTH}@${CONN_ADDR}:${PORT}?sni=${DOMAIN}&allowInsecure=${INSECURE}&insecure=${INSECURE}#${TAG}"
             ;;
     esac
-    echo -e "\n${YELLOW}警告! 某些客户端如(V2rayN 等)导入URL需手动将: 跳过证书验证(allowInsecure) 设置为 true, 或打开: 允许不安全的连接${PLAIN}\n"
+    if [ "$CERT_TYPE" != "real" ]; then
+        echo -e "\n${YELLOW}警告! 您当前使用的是自签名证书，请确保客户端已开启「跳过证书验证」！${PLAIN}\n"
+    else
+        echo -e "\n${GREEN}提示: 您使用的是真实域名证书，已自动配置安全连接，无需跳过证书验证。${PLAIN}\n"
+    fi
+}
+
+get_unique_tag() {
+    local base_tag=$1
+    local counter=2
+    local final_tag=$base_tag
+    while jq -e ".inbounds[] | select(.tag == \"$final_tag\")" "$CONFIG_FILE" >/dev/null 2>&1; do
+        final_tag="${base_tag}-${counter}"
+        ((counter++))
+    done
+    echo "$final_tag"
 }
 
 add_config() {
@@ -329,7 +371,10 @@ add_config() {
     load_secrets
     DEF_PORT=$(rand_port)
     
-    # 提前备份防止写入失败导致原有配置丢失
+    # 获取小写主机名用于生成小写的 Tag
+    HOST_NAME=$(hostname 2>/dev/null || echo "vps")
+    HOST_NAME=$(echo "$HOST_NAME" | tr '[:upper:]' '[:lower:]')
+    
     cp $CONFIG_FILE ${CONFIG_FILE}.bak
     
     case "$proto_idx" in
@@ -341,7 +386,7 @@ add_config() {
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
-            TAG="VLESS-REALITY-$PORT"
+            TAG=$(get_unique_tag "vless-reality-${HOST_NAME}")
             read -p "伪装域名 [默认: apple.com]: " SNI
             SNI=${SNI:-apple.com}
             KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
@@ -361,7 +406,7 @@ add_config() {
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
-            TAG="Hysteria2-$PORT"
+            TAG=$(get_unique_tag "hysteria2-${HOST_NAME}")
             check_cert
             jq --argjson p "$PORT" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
             '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
@@ -378,7 +423,7 @@ add_config() {
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
-            TAG="TUIC-$PORT"
+            TAG=$(get_unique_tag "tuic-${HOST_NAME}")
             check_cert
             jq --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
             '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
@@ -391,7 +436,7 @@ add_config() {
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
-            TAG="AnyTLS-$PORT"
+            TAG=$(get_unique_tag "anytls-${HOST_NAME}")
             check_cert
             jq --argjson p "$PORT" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
             '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
@@ -404,7 +449,7 @@ add_config() {
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
-            TAG="Argo-WS-$PORT"
+            TAG=$(get_unique_tag "argo-ws-${HOST_NAME}")
             read -p "Argo 优选域名/IP [默认: icook.hk]: " ARGO_IP
             ARGO_IP=${ARGO_IP:-icook.hk}
             read -p "Argo 隧道域名: " ARGO_DOMAIN
@@ -478,7 +523,9 @@ modify_config() {
     echo -e "选择: 更改配置\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要更改的配置序号: " idx
+    read -p "请选择要更改的配置序号 (输入 0 返回): " idx
+    if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
     TAG=${TAGS[$idx]}
     if [ -z "$TAG" ]; then echo "输入错误!"; sleep 1; return; fi
@@ -545,19 +592,15 @@ modify_config() {
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .listen_port) = '$NEW_PORT'' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
         
         load_secrets
-        if [[ "$TAG" == *"REALITY"* ]]; then
+        if [[ "$TAG" == *"REALITY"* || "$TAG" == *"reality"* ]]; then
             PUB=$(eval echo \$REALITY_PUB_${OLD_PORT})
             save_secret "REALITY_PUB_${NEW_PORT}" "$PUB"
-        elif [[ "$TAG" == *"Argo"* ]]; then
+        elif [[ "$TAG" == *"Argo"* || "$TAG" == *"argo"* ]]; then
             A_IP=$(eval echo \$ARGO_IP_${OLD_PORT})
             A_DOM=$(eval echo \$ARGO_DOMAIN_${OLD_PORT})
             save_secret "ARGO_IP_${NEW_PORT}" "$A_IP"
             save_secret "ARGO_DOMAIN_${NEW_PORT}" "$A_DOM"
         fi
-        
-        NEW_TAG=$(echo "$TAG" | sed "s/-$OLD_PORT/-$NEW_PORT/")
-        jq '(.inbounds[] | select(.tag=="'$TAG'") | .tag) = "'$NEW_TAG'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
-        TAG=$NEW_TAG
         
         if ! restart_service; then mv ${CONFIG_FILE}.bak $CONFIG_FILE; return; fi
         echo -e "${GREEN}端口已更改为: $NEW_PORT${PLAIN}"
@@ -571,13 +614,15 @@ del_config() {
     echo -e "选择: 删除配置\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要删除的配置序号: " idx
+    read -p "请选择要删除的配置序号 (输入 0 返回): " idx
+    if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
     TAG=${TAGS[$idx]}
     if [ -z "$TAG" ]; then echo "输入错误!"; sleep 1; return; fi
     
     jq 'del(.inbounds[] | select(.tag == "'$TAG'"))' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
-    if [[ "$TAG" == *"Argo"* ]]; then
+    if [[ "$TAG" == *"Argo"* || "$TAG" == *"argo"* ]]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service cloudflared stop 2>/dev/null
             rc-update del cloudflared default 2>/dev/null
@@ -596,7 +641,9 @@ view_single_config() {
     echo -e "选择: 单协议链接\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要查看的配置序号: " idx
+    read -p "请选择要查看的配置序号 (输入 0 返回): " idx
+    if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
     TAG=${TAGS[$idx]}
     if [ -z "$TAG" ]; then echo "输入错误!"; sleep 1; return; fi
@@ -613,18 +660,26 @@ show_all_links() {
     TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' $CONFIG_FILE))
     IP=$(get_ip)
     load_secrets
+    
+    local CONN_ADDR=$IP
+    local INSECURE=1
+    if [ "$CERT_TYPE" == "real" ]; then
+        CONN_ADDR=$DOMAIN
+        INSECURE=0
+    fi
+    
     for TAG in "${TAGS[@]}"; do
         TYPE=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .type' $CONFIG_FILE)
         PORT=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .listen_port' $CONFIG_FILE)
         case "$TYPE" in
             vless)
                 AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
-                if [[ "$TAG" == *"REALITY"* ]]; then
+                if [[ "$TAG" == *"REALITY"* || "$TAG" == *"reality"* ]]; then
                     SNI=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.server_name' $CONFIG_FILE)
                     SID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.short_id[0]' $CONFIG_FILE)
                     PUB=$(eval echo \$REALITY_PUB_${PORT})
                     echo "vless://${AUTH}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-                elif [[ "$TAG" == *"Argo"* ]]; then
+                elif [[ "$TAG" == *"Argo"* || "$TAG" == *"argo"* ]]; then
                     A_IP=$(eval echo \$ARGO_IP_${PORT})
                     A_DOM=$(eval echo \$ARGO_DOMAIN_${PORT})
                     echo "vless://${AUTH}@${A_IP}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
@@ -632,16 +687,16 @@ show_all_links() {
                 ;;
             hysteria2)
                 AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-                echo "hysteria2://${AUTH}@${DOMAIN}:${PORT}?security=tls&alpn=h3&insecure=0&allowInsecure=0&sni=${DOMAIN}#${TAG}" 
+                echo "hysteria2://${AUTH}@${CONN_ADDR}:${PORT}?security=tls&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}&sni=${DOMAIN}#${TAG}" 
                 ;;
             tuic)
                 T_UUID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
                 T_PASS=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-                echo "tuic://${T_UUID}:${T_PASS}@${DOMAIN}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&insecure=0&allowInsecure=0#${TAG}" 
+                echo "tuic://${T_UUID}:${T_PASS}@${CONN_ADDR}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&insecure=${INSECURE}&allowInsecure=${INSECURE}#${TAG}" 
                 ;;
             anytls)
                 AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-                echo "anytls://${AUTH}@${DOMAIN}:${PORT}?sni=${DOMAIN}&allowInsecure=0&insecure=0#${TAG}" 
+                echo "anytls://${AUTH}@${CONN_ADDR}:${PORT}?sni=${DOMAIN}&allowInsecure=${INSECURE}&insecure=${INSECURE}#${TAG}" 
                 ;;
         esac
     done
