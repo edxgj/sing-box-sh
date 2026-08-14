@@ -79,12 +79,6 @@ init_base() {
 
     mkdir -p $CONFIG_DIR $CERT_DIR
     
-    # 默默生成一个有效期 100 年的自签证书，专门给 Hy2/TUIC/AnyTLS 垫底用
-    if [ ! -f "$CERT_DIR/fullchain.cer" ]; then
-        openssl req -x509 -nodes -days 36500 -newkey rsa:2048 -keyout $CERT_DIR/private.key -out $CERT_DIR/fullchain.cer -subj "/CN=bing.com" >/dev/null 2>&1
-        chmod -R 755 $CERT_DIR
-    fi
-    
     if [ ! -f "$CONFIG_FILE" ]; then
         echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > $CONFIG_FILE
     else
@@ -169,7 +163,7 @@ check_cert() {
     load_secrets
     if [ -f "$CERT_DIR/fullchain.cer" ] && [ -f "$CERT_DIR/private.key" ]; then return 0; fi
     
-    echo -e "${YELLOW}当前节点协议需要 TLS 加密！${PLAIN}"
+    echo -e "${YELLOW}当前节点协议强制需要使用 TLS 加密！${PLAIN}"
     read -p "是否申请真实域名证书? (y/n) [默认: y]: " apply_cert
     apply_cert=${apply_cert:-y}
 
@@ -196,11 +190,15 @@ check_cert() {
         chmod -R 755 $CERT_DIR
         echo -e "${GREEN}真实域名证书申请成功！${PLAIN}"
     else
-        echo -e "${CYAN}已为您静默生成自签名证书...${PLAIN}"
+        echo -e "${CYAN}准备生成自签名证书...${PLAIN}"
+        read -p "请输入伪装域名(SNI) [默认: bing.com]: " DOMAIN
+        DOMAIN=${DOMAIN:-bing.com}
+        save_secret "DOMAIN" "$DOMAIN"
         save_secret "CERT_TYPE" "self"
         
-        openssl req -x509 -nodes -days 36500 -newkey rsa:2048 -keyout $CERT_DIR/private.key -out $CERT_DIR/fullchain.cer -subj "/CN=bing.com" >/dev/null 2>&1
+        openssl req -x509 -nodes -days 36500 -newkey rsa:2048 -keyout $CERT_DIR/private.key -out $CERT_DIR/fullchain.cer -subj "/CN=${DOMAIN}" >/dev/null 2>&1
         chmod -R 755 $CERT_DIR
+        echo -e "${GREEN}自签名证书生成完毕！${PLAIN}"
     fi
 }
 
@@ -382,6 +380,7 @@ add_config() {
     load_secrets
     DEF_PORT=$(rand_port)
     
+    # 严格的端口校验逻辑
     read -p "请输入监听端口 [默认随机: $DEF_PORT]: " PORT
     PORT=${PORT:-$DEF_PORT}
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
