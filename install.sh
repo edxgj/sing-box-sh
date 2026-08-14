@@ -49,7 +49,7 @@ load_secrets() {
 
 init_base() {
     if ! command -v jq &> /dev/null || [ ! -f "/usr/local/bin/sing-box" ]; then
-        echo -e "${CYAN}==> 正在安装必要环境与内核...${PLAIN}"
+        echo -e "${CYAN}==> 正在准备环境与内核...${PLAIN}"
         if [ "$OS_TYPE" == "alpine" ]; then
             apk update >/dev/null 2>&1
             apk add curl wget jq tar openssl socat bash nano libc6-compat gcompat >/dev/null 2>&1
@@ -67,6 +67,7 @@ init_base() {
             *) echo -e "${RED}不支持的系统架构: ${ARCH}${PLAIN}"; exit 1 ;;
         esac
 
+        echo -e "${CYAN}==> 正在下载最新版 sing-box 内核...${PLAIN}"
         LATEST_TAG=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         VERSION=${LATEST_TAG#v}
         wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"
@@ -136,7 +137,7 @@ cert_manage() {
         3)
             echo -e "\n------------- 证书信息 -------------"
             if [ -f "$CERT_DIR/fullchain.cer" ]; then
-                echo -e "绑定的域名\t: ${GREEN}${DOMAIN}${PLAIN}"
+                echo -e "绑定的域名\t: ${GREEN}${DOMAIN:-自签默认}${PLAIN}"
                 echo -e "证书类型\t: ${GREEN}${CERT_TYPE:-unknown}${PLAIN}"
                 echo -e "证书路径\t: ${GREEN}$CERT_DIR/fullchain.cer${PLAIN}"
                 echo -e "私钥路径\t: ${GREEN}$CERT_DIR/private.key${PLAIN}"
@@ -162,7 +163,7 @@ check_cert() {
     load_secrets
     if [ -f "$CERT_DIR/fullchain.cer" ] && [ -f "$CERT_DIR/private.key" ]; then return 0; fi
     
-    echo -e "${YELLOW}当前节点协议强制需要使用 TLS 加密！${PLAIN}"
+    echo -e "${YELLOW}当前节点协议需要 TLS 加密！${PLAIN}"
     read -p "是否申请真实域名证书? (y/n) [默认: y]: " apply_cert
     apply_cert=${apply_cert:-y}
 
@@ -189,15 +190,11 @@ check_cert() {
         chmod -R 755 $CERT_DIR
         echo -e "${GREEN}真实域名证书申请成功！${PLAIN}"
     else
-        echo -e "${CYAN}准备生成自签名证书...${PLAIN}"
-        read -p "请输入伪装域名(SNI) [默认: bing.com]: " DOMAIN
-        DOMAIN=${DOMAIN:-bing.com}
-        save_secret "DOMAIN" "$DOMAIN"
+        echo -e "${CYAN}已为您静默生成自签名证书...${PLAIN}"
         save_secret "CERT_TYPE" "self"
         
-        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout $CERT_DIR/private.key -out $CERT_DIR/fullchain.cer -subj "/CN=${DOMAIN}" >/dev/null 2>&1
+        openssl req -x509 -nodes -days 36500 -newkey rsa:2048 -keyout $CERT_DIR/private.key -out $CERT_DIR/fullchain.cer -subj "/CN=bing.com" >/dev/null 2>&1
         chmod -R 755 $CERT_DIR
-        echo -e "${GREEN}自签名证书生成完毕！${PLAIN}"
     fi
 }
 
@@ -251,11 +248,13 @@ print_config_detail() {
     local CONN_ADDR=$IP
     local INSECURE=1
     local INSECURE_TEXT="true"
+    local SNI_URL=""
     
     if [ "$CERT_TYPE" == "real" ]; then
         CONN_ADDR=$DOMAIN
         INSECURE=0
         INSECURE_TEXT="false"
+        SNI_URL="&sni=${DOMAIN}"
     fi
     
     local TYPE=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .type' $CONFIG_FILE)
@@ -267,7 +266,7 @@ print_config_detail() {
     case "$TYPE" in
         vless)
             local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
-            if [[ "$TAG" == *"REALITY"* || "$TAG" == *"reality"* ]]; then
+            if [[ "$TAG" == *"reality"* ]]; then
                 local SNI=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.server_name' $CONFIG_FILE)
                 local SID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.short_id[0]' $CONFIG_FILE)
                 local PUB=$(eval echo \$REALITY_PUB_${PORT})
@@ -281,7 +280,7 @@ print_config_detail() {
                 echo -e "ShortId (sid)\t\t\t= $SID"
                 echo -e "------------- 链接 (URL) -------------"
                 echo "vless://${AUTH}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-            elif [[ "$TAG" == *"Argo"* || "$TAG" == *"argo"* ]]; then
+            elif [[ "$TAG" == *"argo"* ]]; then
                 local A_IP=$(eval echo \$ARGO_IP_${PORT})
                 local A_DOM=$(eval echo \$ARGO_DOMAIN_${PORT})
                 echo -e "地址 (address)\t\t\t= $A_IP"
@@ -304,9 +303,11 @@ print_config_detail() {
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "应用层协议协商 (Alpn)\t\t= h3"
             echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
-            echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            if [ "$CERT_TYPE" == "real" ]; then
+                echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            fi
             echo -e "------------- 链接 (URL) -------------"
-            echo "hysteria2://${AUTH}@${CONN_ADDR}:${PORT}?security=tls&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}&sni=${DOMAIN}#${TAG}"
+            echo "hysteria2://${AUTH}@${CONN_ADDR}:${PORT}?security=tls&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}"
             ;;
         tuic)
             local T_UUID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
@@ -319,9 +320,11 @@ print_config_detail() {
             echo -e "应用层协议协商 (Alpn)\t\t= h3"
             echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
             echo -e "拥塞控制算法 (congestion_control)= bbr"
-            echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            if [ "$CERT_TYPE" == "real" ]; then
+                echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            fi
             echo -e "------------- 链接 (URL) -------------"
-            echo "tuic://${T_UUID}:${T_PASS}@${CONN_ADDR}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&insecure=${INSECURE}&allowInsecure=${INSECURE}#${TAG}"
+            echo "tuic://${T_UUID}:${T_PASS}@${CONN_ADDR}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}"
             ;;
         anytls)
             local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
@@ -330,15 +333,15 @@ print_config_detail() {
             echo -e "密码 (password)\t\t\t= $AUTH"
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
-            echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            if [ "$CERT_TYPE" == "real" ]; then
+                echo -e "伪装域名 (sni)\t\t\t= $DOMAIN"
+            fi
             echo -e "------------- 链接 (URL) -------------"
-            echo "anytls://${AUTH}@${CONN_ADDR}:${PORT}?sni=${DOMAIN}&allowInsecure=${INSECURE}&insecure=${INSECURE}#${TAG}"
+            echo "anytls://${AUTH}@${CONN_ADDR}:${PORT}?insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}"
             ;;
     esac
-    if [ "$CERT_TYPE" != "real" ]; then
+    if [ "$CERT_TYPE" != "real" ] && [[ "$TAG" != *"reality"* ]] && [[ "$TAG" != *"argo"* ]]; then
         echo -e "\n${YELLOW}警告! 您当前使用的是自签名证书，请确保客户端已开启「跳过证书验证」！${PLAIN}\n"
-    else
-        echo -e "\n${GREEN}提示: 您使用的是真实域名证书，已自动配置安全连接，无需跳过证书验证。${PLAIN}\n"
     fi
 }
 
@@ -360,18 +363,28 @@ add_config() {
     echo -e " 2) Hysteria2"
     echo -e " 3) TUIC v5"
     echo -e " 4) AnyTLS"
-    echo -e " 5) VLESS-WS (Argo)\n"
-    read -p "请选择 [1-5]: " proto_idx
+    echo -e " 5) VLESS-WS (Argo)"
+    echo -e " 0) 返回\n"
+    read -p "请选择 [0-5]: " proto_idx
 
     case "$proto_idx" in
         1|2|3|4|5) ;;
+        0) return ;;
         *) echo "输入错误"; sleep 1; return ;;
     esac
 
     load_secrets
     DEF_PORT=$(rand_port)
     
-    # 获取小写主机名用于生成小写的 Tag
+    # 严格的端口校验逻辑
+    read -p "请输入监听端口 [默认随机: $DEF_PORT]: " PORT
+    PORT=${PORT:-$DEF_PORT}
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        echo -e "${RED}错误! 请输入正确的端口, 可选(1-65535)${PLAIN}"
+        sleep 1; return
+    fi
+    echo -e "使用: ${GREEN}${PORT}${PLAIN}"
+    
     HOST_NAME=$(hostname 2>/dev/null || echo "vps")
     HOST_NAME=$(echo "$HOST_NAME" | tr '[:upper:]' '[:lower:]')
     
@@ -379,9 +392,6 @@ add_config() {
     
     case "$proto_idx" in
         1)
-            read -p "请输入监听端口 [默认随机: $DEF_PORT]: " PORT
-            PORT=${PORT:-$DEF_PORT}
-            
             read -p "请输入UUID(回车默认随机): " input_uuid
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
@@ -399,22 +409,16 @@ add_config() {
             '.inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sni,"reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         2)
-            read -p "请输入 Hysteria2 监听端口 (UDP) [默认随机: $DEF_PORT]: " PORT
-            PORT=${PORT:-$DEF_PORT}
-            
             read -p "请输入密码(回车默认随机): " input_pass
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
             TAG=$(get_unique_tag "hysteria2-${HOST_NAME}")
             check_cert
-            jq --argjson p "$PORT" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
-            '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
+            jq --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" \
+            '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         3)
-            read -p "请输入 TUIC 监听端口 (UDP) [默认随机: $DEF_PORT]: " PORT
-            PORT=${PORT:-$DEF_PORT}
-            
             read -p "请输入UUID(回车默认随机): " input_uuid
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
@@ -425,26 +429,20 @@ add_config() {
             
             TAG=$(get_unique_tag "tuic-${HOST_NAME}")
             check_cert
-            jq --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
-            '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
+            jq --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg tag "$TAG" \
+            '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         4)
-            read -p "请输入 AnyTLS 监听端口 (TCP) [默认随机: $DEF_PORT]: " PORT
-            PORT=${PORT:-$DEF_PORT}
-            
             read -p "请输入密码(回车默认随机): " input_pass
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
             TAG=$(get_unique_tag "anytls-${HOST_NAME}")
             check_cert
-            jq --argjson p "$PORT" --arg pass "$PASS" --arg domain "$DOMAIN" --arg tag "$TAG" \
-            '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"server_name":$domain,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
+            jq --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" \
+            '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         5)
-            read -p "请输入本地监听端口 [默认随机: $DEF_PORT]: " PORT
-            PORT=${PORT:-$DEF_PORT}
-            
             read -p "请输入UUID(回车默认随机): " input_uuid
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
@@ -500,7 +498,6 @@ EOF
         return
     fi
     
-    echo -e "${GREEN}配置已添加并成功生效！${PLAIN}"
     print_config_detail "$TAG"
     read -p "按回车键返回菜单..."
 }
@@ -588,14 +585,17 @@ modify_config() {
         NEW_PORT=$(rand_port)
         read -p "请输入新端口 [默认随机: $NEW_PORT]: " input_port
         NEW_PORT=${input_port:-$NEW_PORT}
+        if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
+            echo -e "${RED}输入错误!${PLAIN}"; sleep 1; return
+        fi
         
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .listen_port) = '$NEW_PORT'' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
         
         load_secrets
-        if [[ "$TAG" == *"REALITY"* || "$TAG" == *"reality"* ]]; then
+        if [[ "$TAG" == *"reality"* ]]; then
             PUB=$(eval echo \$REALITY_PUB_${OLD_PORT})
             save_secret "REALITY_PUB_${NEW_PORT}" "$PUB"
-        elif [[ "$TAG" == *"Argo"* || "$TAG" == *"argo"* ]]; then
+        elif [[ "$TAG" == *"argo"* ]]; then
             A_IP=$(eval echo \$ARGO_IP_${OLD_PORT})
             A_DOM=$(eval echo \$ARGO_DOMAIN_${OLD_PORT})
             save_secret "ARGO_IP_${NEW_PORT}" "$A_IP"
@@ -622,7 +622,7 @@ del_config() {
     if [ -z "$TAG" ]; then echo "输入错误!"; sleep 1; return; fi
     
     jq 'del(.inbounds[] | select(.tag == "'$TAG'"))' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
-    if [[ "$TAG" == *"Argo"* || "$TAG" == *"argo"* ]]; then
+    if [[ "$TAG" == *"argo"* ]]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service cloudflared stop 2>/dev/null
             rc-update del cloudflared default 2>/dev/null
@@ -663,9 +663,11 @@ show_all_links() {
     
     local CONN_ADDR=$IP
     local INSECURE=1
+    local SNI_URL=""
     if [ "$CERT_TYPE" == "real" ]; then
         CONN_ADDR=$DOMAIN
         INSECURE=0
+        SNI_URL="&sni=${DOMAIN}"
     fi
     
     for TAG in "${TAGS[@]}"; do
@@ -674,12 +676,12 @@ show_all_links() {
         case "$TYPE" in
             vless)
                 AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
-                if [[ "$TAG" == *"REALITY"* || "$TAG" == *"reality"* ]]; then
+                if [[ "$TAG" == *"reality"* ]]; then
                     SNI=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.server_name' $CONFIG_FILE)
                     SID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.short_id[0]' $CONFIG_FILE)
                     PUB=$(eval echo \$REALITY_PUB_${PORT})
                     echo "vless://${AUTH}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-                elif [[ "$TAG" == *"Argo"* || "$TAG" == *"argo"* ]]; then
+                elif [[ "$TAG" == *"argo"* ]]; then
                     A_IP=$(eval echo \$ARGO_IP_${PORT})
                     A_DOM=$(eval echo \$ARGO_DOMAIN_${PORT})
                     echo "vless://${AUTH}@${A_IP}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
@@ -687,16 +689,16 @@ show_all_links() {
                 ;;
             hysteria2)
                 AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-                echo "hysteria2://${AUTH}@${CONN_ADDR}:${PORT}?security=tls&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}&sni=${DOMAIN}#${TAG}" 
+                echo "hysteria2://${AUTH}@${CONN_ADDR}:${PORT}?security=tls&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}" 
                 ;;
             tuic)
                 T_UUID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
                 T_PASS=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-                echo "tuic://${T_UUID}:${T_PASS}@${CONN_ADDR}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${DOMAIN}&insecure=${INSECURE}&allowInsecure=${INSECURE}#${TAG}" 
+                echo "tuic://${T_UUID}:${T_PASS}@${CONN_ADDR}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}" 
                 ;;
             anytls)
                 AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].password' $CONFIG_FILE)
-                echo "anytls://${AUTH}@${CONN_ADDR}:${PORT}?sni=${DOMAIN}&allowInsecure=${INSECURE}&insecure=${INSECURE}#${TAG}" 
+                echo "anytls://${AUTH}@${CONN_ADDR}:${PORT}?insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}" 
                 ;;
         esac
     done
@@ -723,23 +725,42 @@ view_config() {
 run_manage() {
     clear
     echo -e "选择: 运行管理\n"
-    echo "1) 启动"
-    echo "2) 停止"
-    echo "3) 重启"
-    read -p "请选择 [1-3]: " run_idx
+    echo " 1) 启动"
+    echo " 2) 停止"
+    echo " 3) 重启"
+    echo " 0) 返回"
+    echo ""
+    read -p "请选择 [0-3]: " run_idx
     case "$run_idx" in
         1) 
            if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box start; else systemctl start sing-box; fi
-           echo "已启动"; sleep 1 ;;
+           echo -e "${GREEN}已启动${PLAIN}"; sleep 1 ;;
         2) 
            if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box stop; else systemctl stop sing-box; fi
-           echo "已停止"; sleep 1 ;;
-        3) restart_service; sleep 1 ;;
+           echo -e "${GREEN}已停止${PLAIN}"; sleep 1 ;;
+        3) restart_service; echo -e "${GREEN}已重启${PLAIN}"; sleep 1 ;;
+        0) return ;;
+        *) echo "输入错误!"; sleep 1 ;;
     esac
 }
 
+update_kernel() {
+    clear
+    echo -e "${CYAN}正在检查并更新 sing-box 内核...${PLAIN}\n"
+    rm -f /usr/local/bin/sing-box
+    init_base
+    if [ -f "/usr/local/bin/sing-box" ]; then
+        restart_service
+        NEW_VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        echo -e "\n${GREEN}内核更新成功！当前版本: ${NEW_VER}${PLAIN}"
+    else
+        echo -e "\n${RED}内核更新失败，请检查网络！${PLAIN}"
+    fi
+    read -p "按回车键返回菜单..."
+}
+
 uninstall_all() {
-    read -p "确认卸载? (y/n): " un
+    read -p "确认卸载并删除所有已创建的节点配置吗? (y/n): " un
     if [[ "$un" == "y" ]]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service sing-box stop 2>/dev/null
@@ -760,9 +781,10 @@ uninstall_all() {
             rm -rf $HOME/.acme.sh
         fi
         
-        rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb $CONFIG_DIR
-        rm -f $TMP_JSON
-        echo -e "${GREEN}已彻底卸载！${PLAIN}"
+        # 彻底清空应用和配置文件夹
+        rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb /etc/sing-box
+        rm -f /var/run/sing-box.pid /var/run/cloudflared.pid $TMP_JSON
+        echo -e "${GREEN}已彻底卸载，并完全清理了所有节点配置与相关残留文件！${PLAIN}"
         exit 0
     fi
 }
@@ -802,13 +824,7 @@ menu() {
             4) view_config ;;
             5) cert_manage ;;
             6) run_manage ;;
-            7) 
-               echo "正在更新内核..."
-               rm -f /usr/local/bin/sing-box
-               init_base
-               restart_service
-               sleep 2
-               ;;
+            7) update_kernel ;;
             8) uninstall_all ;;
             0) exit 0 ;;
             *) echo "输入错误!"; sleep 1 ;;
