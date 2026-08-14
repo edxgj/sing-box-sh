@@ -54,9 +54,9 @@ get_latest_version() {
 check_port() {
     local port=$1
     if command -v ss >/dev/null 2>&1; then
-        ss -tuln | grep -qE ":${port}([ \t]|$)"
+        ss -tuln | awk '{print $4}' | grep -qE ":${port}$"
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -tuln | grep -qE ":${port}([ \t]|$)"
+        netstat -tuln | awk '{print $4}' | grep -qE ":${port}$"
     else
         return 1
     fi
@@ -314,7 +314,7 @@ check_cert() {
     load_secrets
     if [ -f "$CERT_DIR/fullchain.cer" ] && [ -f "$CERT_DIR/private.key" ]; then return 0; fi
     
-    echo -e "${YELLOW}当前节点协议需要使用 TLS 加密！${PLAIN}"
+    echo -e "${YELLOW}当前节点协议强制需要使用 TLS 加密！${PLAIN}"
     read -p "是否申请域名证书? (y/n) [默认: y]: " apply_cert
     apply_cert=${apply_cert:-y}
 
@@ -559,7 +559,11 @@ get_unique_tag() {
 }
 
 select_inbound() {
-    TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' $CONFIG_FILE))
+    local old_IFS=$IFS
+    IFS=$'\n'
+    TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' "$CONFIG_FILE"))
+    IFS=$old_IFS
+    
     if [ ${#TAGS[@]} -eq 0 ]; then
         echo -e "${RED}未添加节点配置！${PLAIN}"
         sleep 2
@@ -626,6 +630,7 @@ add_config() {
             
             DEF_TAG="vless-reality-${HOST_NAME}"
             read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
+            input_tag=${input_tag// /-}
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
             read -p "请输入伪装域名 [默认: apple.com]: " SNI
@@ -646,6 +651,7 @@ add_config() {
             
             DEF_TAG="hysteria2-${HOST_NAME}"
             read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
+            input_tag=${input_tag// /-}
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
             check_cert
@@ -663,6 +669,7 @@ add_config() {
             
             DEF_TAG="tuic-${HOST_NAME}"
             read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
+            input_tag=${input_tag// /-}
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
             check_cert
@@ -676,6 +683,7 @@ add_config() {
             
             DEF_TAG="anytls-${HOST_NAME}"
             read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
+            input_tag=${input_tag// /-}
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
             check_cert
@@ -689,6 +697,7 @@ add_config() {
             
             DEF_TAG="vless-argo-${HOST_NAME}"
             read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
+            input_tag=${input_tag// /-}
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
             read -p "请输入 Argo 优选域名/IP [默认: saas.sin.fan]: " ARGO_IP
@@ -714,7 +723,7 @@ add_config() {
             fi
             
             if [ "$OS_TYPE" == "alpine" ]; then
-                cat > /etc/init.d/cloudflared-${TAG} << EOF
+                cat > "/etc/init.d/cloudflared-${TAG}" << EOF
 #!/sbin/openrc-run
 name="cloudflared-${TAG}"
 command="/usr/local/bin/cloudflared"
@@ -725,11 +734,11 @@ depend() {
     need net
 }
 EOF
-                chmod +x /etc/init.d/cloudflared-${TAG}
-                rc-update add cloudflared-${TAG} default >/dev/null 2>&1
-                rc-service cloudflared-${TAG} restart >/dev/null 2>&1
+                chmod +x "/etc/init.d/cloudflared-${TAG}"
+                rc-update add "cloudflared-${TAG}" default >/dev/null 2>&1
+                rc-service "cloudflared-${TAG}" restart >/dev/null 2>&1
             else
-                cat > /etc/systemd/system/cloudflared-${TAG}.service << EOF
+                cat > "/etc/systemd/system/cloudflared-${TAG}.service" << EOF
 [Unit]
 Description=cloudflared tunnel for ${TAG}
 After=network.target
@@ -743,7 +752,7 @@ RestartSec=10s
 WantedBy=multi-user.target
 EOF
                 systemctl daemon-reload >/dev/null 2>&1
-                systemctl enable cloudflared-${TAG} --now >/dev/null 2>&1
+                systemctl enable "cloudflared-${TAG}" --now >/dev/null 2>&1
             fi
             ;;
     esac
@@ -908,6 +917,7 @@ modify_config() {
         sleep 2
     elif [ "$action" == "tag" ]; then
         read -p "请输入新的节点名称: " NEW_TAG
+        NEW_TAG=${NEW_TAG// /-}
         if [ -z "$NEW_TAG" ]; then
             echo -e "${RED}输入不能为空!${PLAIN}"
             mv ${CONFIG_FILE}.bak $CONFIG_FILE
@@ -926,20 +936,20 @@ modify_config() {
         
         if [ "$IS_ARGO" -eq 1 ]; then
             if [ "$OS_TYPE" == "alpine" ]; then
-                rc-service cloudflared-${TAG} stop >/dev/null 2>&1
-                rc-update del cloudflared-${TAG} default >/dev/null 2>&1
-                mv /etc/init.d/cloudflared-${TAG} /etc/init.d/cloudflared-${NEW_TAG}
-                sed -i "s/name=\"cloudflared-${TAG}\"/name=\"cloudflared-${NEW_TAG}\"/g" /etc/init.d/cloudflared-${NEW_TAG}
-                sed -i "s/cloudflared-${TAG}\.pid/cloudflared-${NEW_TAG}\.pid/g" /etc/init.d/cloudflared-${NEW_TAG}
-                rc-update add cloudflared-${NEW_TAG} default >/dev/null 2>&1
-                rc-service cloudflared-${NEW_TAG} start >/dev/null 2>&1
+                rc-service "cloudflared-${TAG}" stop >/dev/null 2>&1
+                rc-update del "cloudflared-${TAG}" default >/dev/null 2>&1
+                mv "/etc/init.d/cloudflared-${TAG}" "/etc/init.d/cloudflared-${NEW_TAG}"
+                sed -i "s/name=\"cloudflared-${TAG}\"/name=\"cloudflared-${NEW_TAG}\"/g" "/etc/init.d/cloudflared-${NEW_TAG}"
+                sed -i "s/cloudflared-${TAG}\.pid/cloudflared-${NEW_TAG}\.pid/g" "/etc/init.d/cloudflared-${NEW_TAG}"
+                rc-update add "cloudflared-${NEW_TAG}" default >/dev/null 2>&1
+                rc-service "cloudflared-${NEW_TAG}" start >/dev/null 2>&1
             else
-                systemctl stop cloudflared-${TAG} >/dev/null 2>&1
-                systemctl disable cloudflared-${TAG} >/dev/null 2>&1
-                mv /etc/systemd/system/cloudflared-${TAG}.service /etc/systemd/system/cloudflared-${NEW_TAG}.service
-                sed -i "s/tunnel for ${TAG}/tunnel for ${NEW_TAG}/g" /etc/systemd/system/cloudflared-${NEW_TAG}.service
+                systemctl stop "cloudflared-${TAG}" >/dev/null 2>&1
+                systemctl disable "cloudflared-${TAG}" >/dev/null 2>&1
+                mv "/etc/systemd/system/cloudflared-${TAG}.service" "/etc/systemd/system/cloudflared-${NEW_TAG}.service"
+                sed -i "s/tunnel for ${TAG}/tunnel for ${NEW_TAG}/g" "/etc/systemd/system/cloudflared-${NEW_TAG}.service"
                 systemctl daemon-reload >/dev/null 2>&1
-                systemctl enable cloudflared-${NEW_TAG} --now >/dev/null 2>&1
+                systemctl enable "cloudflared-${NEW_TAG}" --now >/dev/null 2>&1
             fi
         fi
 
@@ -981,13 +991,13 @@ del_config() {
     
     if [ "$IS_ARGO" -eq 1 ]; then
         if [ "$OS_TYPE" == "alpine" ]; then
-            rc-service cloudflared-${TAG} stop >/dev/null 2>&1
-            rc-update del cloudflared-${TAG} default >/dev/null 2>&1
-            rm -f /etc/init.d/cloudflared-${TAG}
+            rc-service "cloudflared-${TAG}" stop >/dev/null 2>&1
+            rc-update del "cloudflared-${TAG}" default >/dev/null 2>&1
+            rm -f "/etc/init.d/cloudflared-${TAG}"
         else
-            systemctl stop cloudflared-${TAG} >/dev/null 2>&1
-            systemctl disable cloudflared-${TAG} >/dev/null 2>&1
-            rm -f /etc/systemd/system/cloudflared-${TAG}.service
+            systemctl stop "cloudflared-${TAG}" >/dev/null 2>&1
+            systemctl disable "cloudflared-${TAG}" >/dev/null 2>&1
+            rm -f "/etc/systemd/system/cloudflared-${TAG}.service"
             systemctl daemon-reload >/dev/null 2>&1
         fi
     fi
@@ -1016,7 +1026,11 @@ show_all_links() {
     echo -e "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     echo -e "🚀【 聚合节点 】节点信息如下：\n"
     echo -e "分享链接"
-    TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' $CONFIG_FILE))
+    
+    local old_IFS=$IFS
+    IFS=$'\n'
+    TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' "$CONFIG_FILE"))
+    IFS=$old_IFS
     
     if [ ${#TAGS[@]} -eq 0 ]; then
         echo -e "\n${RED}未添加节点配置！${PLAIN}"
