@@ -79,6 +79,12 @@ init_base() {
 
     mkdir -p $CONFIG_DIR $CERT_DIR
     
+    # 默默生成一个有效期 100 年的自签证书，专门给 Hy2/TUIC/AnyTLS 垫底用
+    if [ ! -f "$CERT_DIR/fullchain.cer" ]; then
+        openssl req -x509 -nodes -days 36500 -newkey rsa:2048 -keyout $CERT_DIR/private.key -out $CERT_DIR/fullchain.cer -subj "/CN=bing.com" >/dev/null 2>&1
+        chmod -R 755 $CERT_DIR
+    fi
+    
     if [ ! -f "$CONFIG_FILE" ]; then
         echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > $CONFIG_FILE
     else
@@ -455,7 +461,7 @@ add_config() {
             save_secret "ARGO_DOMAIN_${PORT}" "$ARGO_DOMAIN"
             
             jq --argjson p "$PORT" --arg uuid "$UUID" --arg tag "$TAG" \
-            '.inbounds += [{"type":"vless","tag":$tag,"listen":"localhost","listen_port":$p,"users":[{"uuid":$uuid}],"transport":{"type":"ws","path":"/argo"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
+            '.inbounds += [{"type":"vless","tag":$tag,"listen":"127.0.0.1","listen_port":$p,"users":[{"uuid":$uuid}],"transport":{"type":"ws","path":"/argo"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             
             if ! command -v cloudflared &> /dev/null; then
                 ARCH=$(uname -m)
