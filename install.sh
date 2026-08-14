@@ -203,6 +203,17 @@ check_cert() {
 }
 
 restart_service() {
+    # 动态检测配置是否为空，如果为空直接停止服务，不报错
+    local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
+    if [ "$INBOUND_COUNT" -eq 0 ]; then
+        if [ "$OS_TYPE" == "alpine" ]; then
+            rc-service sing-box stop >/dev/null 2>&1
+        else
+            systemctl stop sing-box >/dev/null 2>&1
+        fi
+        return 0
+    fi
+
     if ! /usr/local/bin/sing-box check -c $CONFIG_FILE >/dev/null 2>&1; then
         echo -e "${RED}配置文件校验失败，请检查语法或端口冲突！${PLAIN}"
         /usr/local/bin/sing-box check -c $CONFIG_FILE
@@ -270,7 +281,7 @@ print_config_detail() {
     case "$TYPE" in
         vless)
             local AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
-            if [[ "$TAG" == *"reality"* ]]; then
+            if jq -e '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1; then
                 local SNI=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.server_name' $CONFIG_FILE)
                 local SID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.short_id[0]' $CONFIG_FILE)
                 local PUB=$(eval echo \$REALITY_PUB_${PORT})
@@ -284,7 +295,7 @@ print_config_detail() {
                 echo -e "ShortId (sid)\t\t\t= $SID"
                 echo -e "------------- 链接 (URL) -------------"
                 echo "vless://${AUTH}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-            elif [[ "$TAG" == *"argo"* ]]; then
+            elif jq -e '.inbounds[] | select(.tag=="'$TAG'") | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
                 local A_IP=$(eval echo \$ARGO_IP_${PORT})
                 local A_DOM=$(eval echo \$ARGO_DOMAIN_${PORT})
                 echo -e "地址 (address)\t\t\t= $A_IP"
@@ -344,7 +355,8 @@ print_config_detail() {
             echo "anytls://${AUTH}@${CONN_ADDR}:${PORT}?insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}"
             ;;
     esac
-    if [ "$CERT_TYPE" != "real" ] && [[ "$TAG" != *"reality"* ]] && [[ "$TAG" != *"argo"* ]]; then
+    
+    if [ "$CERT_TYPE" != "real" ] && ! jq -e '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1 && ! jq -e '.inbounds[] | select(.tag=="'$TAG'") | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
         echo -e "\n${YELLOW}警告! 您当前使用的是自签名证书，请确保客户端已开启「跳过证书验证」！${PLAIN}\n"
     fi
 }
@@ -380,7 +392,6 @@ add_config() {
     load_secrets
     DEF_PORT=$(rand_port)
     
-    # 严格的端口校验逻辑
     read -p "请输入监听端口 [默认随机: $DEF_PORT]: " PORT
     PORT=${PORT:-$DEF_PORT}
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
@@ -400,7 +411,10 @@ add_config() {
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
-            TAG=$(get_unique_tag "vless-reality-${HOST_NAME}")
+            DEF_TAG="vless-reality-${HOST_NAME}"
+            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
+            
             read -p "伪装域名 [默认: apple.com]: " SNI
             SNI=${SNI:-apple.com}
             KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
@@ -417,7 +431,10 @@ add_config() {
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
-            TAG=$(get_unique_tag "hysteria2-${HOST_NAME}")
+            DEF_TAG="hysteria2-${HOST_NAME}"
+            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
+            
             check_cert
             jq --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" \
             '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
@@ -431,7 +448,10 @@ add_config() {
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
-            TAG=$(get_unique_tag "tuic-${HOST_NAME}")
+            DEF_TAG="tuic-${HOST_NAME}"
+            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
+            
             check_cert
             jq --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg tag "$TAG" \
             '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
@@ -441,7 +461,10 @@ add_config() {
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
-            TAG=$(get_unique_tag "anytls-${HOST_NAME}")
+            DEF_TAG="anytls-${HOST_NAME}"
+            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
+            
             check_cert
             jq --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" \
             '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h2","http/1.1"],"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
@@ -451,7 +474,10 @@ add_config() {
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
-            TAG=$(get_unique_tag "argo-ws-${HOST_NAME}")
+            DEF_TAG="argo-ws-${HOST_NAME}"
+            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
+            
             read -p "Argo 优选域名/IP [默认: icook.hk]: " ARGO_IP
             ARGO_IP=${ARGO_IP:-icook.hk}
             read -p "Argo 隧道域名: " ARGO_DOMAIN
@@ -539,28 +565,34 @@ modify_config() {
     if [ "$TYPE" == "vless" ]; then
         echo -e " 1) 更改 UUID"
         echo -e " 2) 更改端口"
+        echo -e " 3) 更改节点名称"
         echo -e " 0) 返回"
-        read -p "请选择 [0-2]: " mod_idx
+        read -p "请选择 [0-3]: " mod_idx
         if [ "$mod_idx" == "1" ]; then action="uuid"
         elif [ "$mod_idx" == "2" ]; then action="port"
+        elif [ "$mod_idx" == "3" ]; then action="tag"
         else return; fi
     elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "anytls" ]]; then
         echo -e " 1) 更改密码"
         echo -e " 2) 更改端口"
+        echo -e " 3) 更改节点名称"
         echo -e " 0) 返回"
-        read -p "请选择 [0-2]: " mod_idx
+        read -p "请选择 [0-3]: " mod_idx
         if [ "$mod_idx" == "1" ]; then action="pass"
         elif [ "$mod_idx" == "2" ]; then action="port"
+        elif [ "$mod_idx" == "3" ]; then action="tag"
         else return; fi
     elif [ "$TYPE" == "tuic" ]; then
         echo -e " 1) 更改 UUID"
         echo -e " 2) 更改密码"
         echo -e " 3) 更改端口"
+        echo -e " 4) 更改节点名称"
         echo -e " 0) 返回"
-        read -p "请选择 [0-3]: " mod_idx
+        read -p "请选择 [0-4]: " mod_idx
         if [ "$mod_idx" == "1" ]; then action="uuid"
         elif [ "$mod_idx" == "2" ]; then action="pass"
         elif [ "$mod_idx" == "3" ]; then action="port"
+        elif [ "$mod_idx" == "4" ]; then action="tag"
         else return; fi
     else
         echo "未知的协议类型"
@@ -596,10 +628,10 @@ modify_config() {
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .listen_port) = '$NEW_PORT'' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
         
         load_secrets
-        if [[ "$TAG" == *"reality"* ]]; then
+        if jq -e '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1; then
             PUB=$(eval echo \$REALITY_PUB_${OLD_PORT})
             save_secret "REALITY_PUB_${NEW_PORT}" "$PUB"
-        elif [[ "$TAG" == *"argo"* ]]; then
+        elif jq -e '.inbounds[] | select(.tag=="'$TAG'") | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
             A_IP=$(eval echo \$ARGO_IP_${OLD_PORT})
             A_DOM=$(eval echo \$ARGO_DOMAIN_${OLD_PORT})
             save_secret "ARGO_IP_${NEW_PORT}" "$A_IP"
@@ -609,6 +641,22 @@ modify_config() {
         if ! restart_service; then mv ${CONFIG_FILE}.bak $CONFIG_FILE; return; fi
         echo -e "${GREEN}端口已更改为: $NEW_PORT${PLAIN}"
         echo -e "${GREEN}节点 $TAG 的配置已生效！${PLAIN}"
+        sleep 2
+    elif [ "$action" == "tag" ]; then
+        read -p "请输入新的节点名称: " NEW_TAG
+        if [ -z "$NEW_TAG" ]; then
+            echo -e "${RED}输入不能为空!${PLAIN}"
+            mv ${CONFIG_FILE}.bak $CONFIG_FILE
+            sleep 1; return
+        fi
+        if jq -e ".inbounds[] | select(.tag == \"$NEW_TAG\")" "$CONFIG_FILE" >/dev/null 2>&1; then
+            echo -e "${RED}该节点名称已存在，请换一个名称！${PLAIN}"
+            mv ${CONFIG_FILE}.bak $CONFIG_FILE
+            sleep 1; return
+        fi
+        jq '(.inbounds[] | select(.tag=="'$TAG'") | .tag) = "'$NEW_TAG'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
+        if ! restart_service; then mv ${CONFIG_FILE}.bak $CONFIG_FILE; return; fi
+        echo -e "${GREEN}节点名称已成功更改为: $NEW_TAG${PLAIN}"
         sleep 2
     fi
 }
@@ -625,18 +673,31 @@ del_config() {
     TAG=${TAGS[$idx]}
     if [ -z "$TAG" ]; then echo "输入错误!"; sleep 1; return; fi
     
+    local IS_ARGO=0
+    if jq -e '.inbounds[] | select(.tag=="'$TAG'") | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
+        IS_ARGO=1
+    fi
+    
     jq 'del(.inbounds[] | select(.tag == "'$TAG'"))' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
-    if [[ "$TAG" == *"argo"* ]]; then
+    
+    if [ "$IS_ARGO" -eq 1 ]; then
         if [ "$OS_TYPE" == "alpine" ]; then
-            rc-service cloudflared stop 2>/dev/null
-            rc-update del cloudflared default 2>/dev/null
+            rc-service cloudflared stop >/dev/null 2>&1
+            rc-update del cloudflared default >/dev/null 2>&1
             rm -f /etc/init.d/cloudflared
         else
-            cloudflared service uninstall 2>/dev/null
+            cloudflared service uninstall >/dev/null 2>&1
         fi
     fi
+    
     restart_service
-    echo -e "${GREEN}配置 $TAG 已删除！${PLAIN}"
+    
+    local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
+    if [ "$INBOUND_COUNT" -eq 0 ]; then
+        echo -e "${GREEN}配置 $TAG 已删除！检测到当前已无节点配置，内核已自动停止运行。${PLAIN}"
+    else
+        echo -e "${GREEN}配置 $TAG 已删除！${PLAIN}"
+    fi
     sleep 2
 }
 
@@ -680,12 +741,12 @@ show_all_links() {
         case "$TYPE" in
             vless)
                 AUTH=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid' $CONFIG_FILE)
-                if [[ "$TAG" == *"reality"* ]]; then
+                if jq -e '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1; then
                     SNI=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.server_name' $CONFIG_FILE)
                     SID=$(jq -r '.inbounds[] | select(.tag=="'$TAG'") | .tls.reality.short_id[0]' $CONFIG_FILE)
                     PUB=$(eval echo \$REALITY_PUB_${PORT})
                     echo "vless://${AUTH}@${IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-                elif [[ "$TAG" == *"argo"* ]]; then
+                elif jq -e '.inbounds[] | select(.tag=="'$TAG'") | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
                     A_IP=$(eval echo \$ARGO_IP_${PORT})
                     A_DOM=$(eval echo \$ARGO_DOMAIN_${PORT})
                     echo "vless://${AUTH}@${A_IP}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
@@ -737,12 +798,21 @@ run_manage() {
     read -p "请选择 [0-3]: " run_idx
     case "$run_idx" in
         1) 
+           local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
+           if [ "$INBOUND_COUNT" -eq 0 ]; then
+               echo -e "${RED}当前无任何节点配置，内核启动无意义！请先添加配置。${PLAIN}"; sleep 2; return
+           fi
            if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box start; else systemctl start sing-box; fi
            echo -e "${GREEN}已启动${PLAIN}"; sleep 1 ;;
         2) 
            if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box stop; else systemctl stop sing-box; fi
            echo -e "${GREEN}已停止${PLAIN}"; sleep 1 ;;
-        3) restart_service; echo -e "${GREEN}已重启${PLAIN}"; sleep 1 ;;
+        3) 
+           local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
+           if [ "$INBOUND_COUNT" -eq 0 ]; then
+               echo -e "${RED}当前无任何节点配置，无法重启！请先添加配置。${PLAIN}"; sleep 2; return
+           fi
+           restart_service; echo -e "${GREEN}已重启${PLAIN}"; sleep 1 ;;
         0) return ;;
         *) echo "输入错误!"; sleep 1 ;;
     esac
@@ -785,7 +855,6 @@ uninstall_all() {
             rm -rf $HOME/.acme.sh
         fi
         
-        # 彻底清空应用和配置文件夹
         rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb /etc/sing-box
         rm -f /var/run/sing-box.pid /var/run/cloudflared.pid $TMP_JSON
         echo -e "${GREEN}已彻底卸载，并完全清理了所有节点配置与相关残留文件！${PLAIN}"
