@@ -54,9 +54,9 @@ get_latest_version() {
 check_port() {
     local port=$1
     if command -v ss >/dev/null 2>&1; then
-        ss -tuln | grep -qw ":${port}"
+        ss -tuln | awk '{print $4}' | grep -qE ":${port}$"
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -tuln | grep -qw ":${port}"
+        netstat -tuln | awk '{print $4}' | grep -qE ":${port}$"
     else
         return 1
     fi
@@ -354,8 +354,8 @@ check_cert() {
 }
 
 restart_service() {
-    local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
-    if [ "$INBOUND_COUNT" -eq 0 ]; then
+    local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE 2>/dev/null)
+    if [ -z "$INBOUND_COUNT" ] || [ "$INBOUND_COUNT" -eq 0 ]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service sing-box stop >/dev/null 2>&1
         else
@@ -385,6 +385,10 @@ EOF
         chmod +x /etc/init.d/sing-box
         rc-update add sing-box default >/dev/null 2>&1
         rc-service sing-box restart >/dev/null 2>&1
+        sleep 1
+        if ! rc-service sing-box status 2>/dev/null | grep -q 'started'; then
+            return 1
+        fi
     else
         cat > /etc/systemd/system/sing-box.service << 'EOF'
 [Unit]
@@ -401,6 +405,10 @@ EOF
         systemctl daemon-reload
         systemctl enable sing-box --now >/dev/null 2>&1
         systemctl restart sing-box >/dev/null 2>&1
+        sleep 1
+        if [ "$(systemctl is-active sing-box 2>/dev/null)" != "active" ]; then
+            return 1
+        fi
     fi
     return 0
 }
@@ -679,7 +687,7 @@ add_config() {
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
-            DEF_TAG="vless-arog-${HOST_NAME}"
+            DEF_TAG="vless-argo-${HOST_NAME}"
             read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
