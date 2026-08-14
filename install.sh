@@ -559,7 +559,7 @@ modify_config() {
     echo -e "选择: 更改配置\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要更改的配置序号: " idx
+    read -p "请选择要更改的配置序号 (输入 0 返回): " idx
     if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
     if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
@@ -675,7 +675,7 @@ del_config() {
     echo -e "选择: 删除配置\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要删除的配置序号: " idx
+    read -p "请选择要删除的配置序号 (输入 0 返回): " idx
     if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
     if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
@@ -715,7 +715,7 @@ view_single_config() {
     echo -e "选择: 单协议链接\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要查看的配置序号: " idx
+    read -p "请选择要查看的配置序号 (输入 0 返回): " idx
     if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
     if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
@@ -891,7 +891,7 @@ update_manage() {
 }
 
 uninstall_all() {
-    read -p "确认删除脚本,sing-box,和所有节点配置吗？(y/n): " un
+    read -p "确认删除脚本,sing-box,节点配置吗？(y/n): " un
     if [[ "$un" == "y" ]]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service sing-box stop 2>/dev/null
