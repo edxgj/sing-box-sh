@@ -884,7 +884,7 @@ update_manage() {
 }
 
 uninstall_all() {
-    read -p "确认卸载sing-box和删除所有节点配置吗？(y/n): " un
+    read -p "确认卸载脚本,sing-box和删除所有节点配置吗？(y/n): " un
     if [[ "$un" == "y" ]]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service sing-box stop 2>/dev/null
