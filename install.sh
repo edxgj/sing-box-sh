@@ -679,12 +679,12 @@ add_config() {
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
-            DEF_TAG="argo-ws-${HOST_NAME}"
+            DEF_TAG="vless-arog-${HOST_NAME}"
             read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
-            read -p "请输入 Argo 优选域名/IP [默认: icook.hk]: " ARGO_IP
-            ARGO_IP=${ARGO_IP:-icook.hk}
+            read -p "请输入 Argo 优选域名/IP [默认: saas.sin.fan]: " ARGO_IP
+            ARGO_IP=${ARGO_IP:-saas.sin.fan}
             read -p "请输入 Argo 隧道域名: " ARGO_DOMAIN
             read -p "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN
             save_secret "ARGO_IP_${PORT}" "$ARGO_IP"
