@@ -710,7 +710,7 @@ add_config() {
 #!/sbin/openrc-run
 name="cloudflared-${TAG}"
 command="/usr/local/bin/cloudflared"
-command_args="tunnel --no-autoupdate run --token ${ARGO_TOKEN}"
+command_args="tunnel --no-autoupdate --protocol http2 run --token ${ARGO_TOKEN}"
 command_background=true
 pidfile="/var/run/cloudflared-${TAG}.pid"
 depend() {
@@ -727,7 +727,7 @@ Description=cloudflared tunnel for ${TAG}
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token ${ARGO_TOKEN}
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --protocol http2 run --token ${ARGO_TOKEN}
 Restart=on-failure
 RestartSec=10s
 
