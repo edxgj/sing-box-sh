@@ -54,9 +54,9 @@ get_latest_version() {
 check_port() {
     local port=$1
     if command -v ss >/dev/null 2>&1; then
-        ss -tuln | awk '{print $4}' | grep -qE ":${port}$"
+        ss -tuln | grep -qE ":${port}([ \t]|$)"
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -tuln | awk '{print $4}' | grep -qE ":${port}$"
+        netstat -tuln | grep -qE ":${port}([ \t]|$)"
     else
         return 1
     fi
