@@ -67,14 +67,23 @@ init_base() {
             *) echo -e "${RED}不支持的系统架构: ${ARCH}${PLAIN}"; exit 1 ;;
         esac
 
-        echo -e "${CYAN}==> 正在下载最新版 sing-box 内核...${PLAIN}"
+        echo -e "${CYAN}==> 正在获取最新版 sing-box 内核信息...${PLAIN}"
         LATEST_TAG=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         VERSION=${LATEST_TAG#v}
-        wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"
+        
+        if [ -z "$VERSION" ]; then
+            echo -e "${RED}获取版本信息失败，请检查网络！${PLAIN}"
+            exit 1
+        fi
+
+        echo -e "${CYAN}==> 发现最新版本 v${VERSION}，开始下载...${PLAIN}"
+        wget --show-progress -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz" || wget -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"
+        
         tar -xzf sing-box.tar.gz
         mv sing-box-${VERSION}-linux-${SB_ARCH}/sing-box /usr/local/bin/sing-box
         chmod +x /usr/local/bin/sing-box
         rm -rf sing-box.tar.gz sing-box-${VERSION}-linux-${SB_ARCH}
+        echo -e "${GREEN}==> 内核下载并解压完毕！${PLAIN}"
     fi
 
     mkdir -p $CONFIG_DIR $CERT_DIR
@@ -90,7 +99,7 @@ init_base() {
 cert_manage() {
     clear
     echo -e "选择: 证书管理\n"
-    echo -e " 1) 申请新证书 (覆盖当前)"
+    echo -e " 1) 申请新证书"
     echo -e " 2) 手动强制续期"
     echo -e " 3) 查看证书与自动续期状态"
     echo -e " 0) 返回"
@@ -101,7 +110,7 @@ cert_manage() {
     case "$cert_idx" in
         1)
             echo -e "${YELLOW}注意: 申请证书需要域名已成功解析到本机 IP！${PLAIN}"
-            read -p "请输入你的域名 (如 node.domain.com): " NEW_DOMAIN
+            read -p "请输入你的域名: " NEW_DOMAIN
             read -p "请输入 Cloudflare 邮箱: " NEW_CF_Email
             read -p "请输入 Cloudflare Global API Key: " NEW_CF_Key
             
@@ -121,7 +130,7 @@ cert_manage() {
             fi
             ~/.acme.sh/acme.sh --installcert -d ${NEW_DOMAIN} --fullchainpath $CERT_DIR/fullchain.cer --keypath $CERT_DIR/private.key --reloadcmd "$RELOAD_CMD"
             chmod -R 755 $CERT_DIR
-            echo -e "${GREEN}证书申请并安装完成！(acme.sh 已自动配置系统定时续期任务)${PLAIN}"
+            echo -e "${GREEN}证书申请并安装完成！${PLAIN}"
             sleep 2
             ;;
         2)
@@ -146,7 +155,7 @@ cert_manage() {
                     echo -e "${GREEN}acme.sh 自动续期定时任务已正常运行中！${PLAIN}"
                     crontab -l | grep "acme.sh"
                 else
-                    echo -e "${RED}警告: 未发现 acme.sh 自动续期定时任务 (若您使用的是自签名证书请忽略此警告)！${PLAIN}"
+                    echo -e "${RED}警告: 未发现 acme.sh 自动续期定时任务！${PLAIN}"
                 fi
             else
                 echo -e "${YELLOW}当前未安装任何域名证书。${PLAIN}"
@@ -169,7 +178,7 @@ check_cert() {
 
     if [[ "$apply_cert" == "y" ]]; then
         echo -e "${CYAN}准备自动调用证书申请...${PLAIN}"
-        read -p "请输入你的真实域名 (如 node.domain.com): " DOMAIN
+        read -p "请输入你的真实域名: " DOMAIN
         read -p "请输入 Cloudflare 邮箱: " CF_Email
         read -p "请输入 Cloudflare Global API Key: " CF_Key
         save_secret "DOMAIN" "$DOMAIN"
@@ -191,7 +200,7 @@ check_cert() {
         echo -e "${GREEN}真实域名证书申请成功！${PLAIN}"
     else
         echo -e "${CYAN}准备生成自签名证书...${PLAIN}"
-        read -p "请输入伪装域名(SNI) [默认: bing.com]: " DOMAIN
+        read -p "请输入伪装域名 [默认: bing.com]: " DOMAIN
         DOMAIN=${DOMAIN:-bing.com}
         save_secret "DOMAIN" "$DOMAIN"
         save_secret "CERT_TYPE" "self"
@@ -203,7 +212,6 @@ check_cert() {
 }
 
 restart_service() {
-    # 动态检测配置是否为空，如果为空直接停止服务，不报错
     local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
     if [ "$INBOUND_COUNT" -eq 0 ]; then
         if [ "$OS_TYPE" == "alpine" ]; then
@@ -392,7 +400,7 @@ add_config() {
     load_secrets
     DEF_PORT=$(rand_port)
     
-    read -p "请输入监听端口 [默认随机: $DEF_PORT]: " PORT
+    read -p "请输入监听端口 [默认: $DEF_PORT]: " PORT
     PORT=${PORT:-$DEF_PORT}
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
         echo -e "${RED}错误! 请输入正确的端口, 可选(1-65535)${PLAIN}"
@@ -407,15 +415,15 @@ add_config() {
     
     case "$proto_idx" in
         1)
-            read -p "请输入UUID(回车默认随机): " input_uuid
+            read -p "请输入UUID [默认随机]: " input_uuid
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
             DEF_TAG="vless-reality-${HOST_NAME}"
-            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
-            read -p "伪装域名 [默认: apple.com]: " SNI
+            read -p "请输入伪装域名 [默认: apple.com]: " SNI
             SNI=${SNI:-apple.com}
             KEYS=$(/usr/local/bin/sing-box generate reality-keypair)
             PK=$(echo "$KEYS" | grep PrivateKey | awk '{print $2}')
@@ -427,12 +435,12 @@ add_config() {
             '.inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sni,"reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         2)
-            read -p "请输入密码(回车默认随机): " input_pass
+            read -p "请输入密码 [默认随机]: " input_pass
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
             DEF_TAG="hysteria2-${HOST_NAME}"
-            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
             check_cert
@@ -440,16 +448,16 @@ add_config() {
             '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         3)
-            read -p "请输入UUID(回车默认随机): " input_uuid
+            read -p "请输入UUID [默认随机]: " input_uuid
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
-            read -p "请输入密码(回车默认随机): " input_pass
+            read -p "请输入密码 [默认随机]: " input_pass
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
             DEF_TAG="tuic-${HOST_NAME}"
-            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
             check_cert
@@ -457,12 +465,12 @@ add_config() {
             '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         4)
-            read -p "请输入密码(回车默认随机): " input_pass
+            read -p "请输入密码 [默认随机]: " input_pass
             PASS=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "密码: ${GREEN}${PASS}${PLAIN}"
             
             DEF_TAG="anytls-${HOST_NAME}"
-            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
             check_cert
@@ -470,18 +478,18 @@ add_config() {
             '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h2","http/1.1"],"certificate_path":"/etc/sing-box/cert/fullchain.cer","key_path":"/etc/sing-box/cert/private.key"}}]' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
             ;;
         5)
-            read -p "请输入UUID(回车默认随机): " input_uuid
+            read -p "请输入UUID [默认随机]: " input_uuid
             UUID=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
             echo -e "UUID: ${GREEN}${UUID}${PLAIN}"
             
             DEF_TAG="argo-ws-${HOST_NAME}"
-            read -p "请输入节点名称(回车默认: $DEF_TAG): " input_tag
+            read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
             TAG=$(get_unique_tag "${input_tag:-$DEF_TAG}")
             
-            read -p "Argo 优选域名/IP [默认: icook.hk]: " ARGO_IP
+            read -p "请输入 Argo 优选域名/IP [默认: icook.hk]: " ARGO_IP
             ARGO_IP=${ARGO_IP:-icook.hk}
-            read -p "Argo 隧道域名: " ARGO_DOMAIN
-            read -p "Cloudflare Tunnel Token: " ARGO_TOKEN
+            read -p "请输入 Argo 隧道域名: " ARGO_DOMAIN
+            read -p "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN
             save_secret "ARGO_IP_${PORT}" "$ARGO_IP"
             save_secret "ARGO_DOMAIN_${PORT}" "$ARGO_DOMAIN"
             
@@ -495,7 +503,8 @@ add_config() {
                     aarch64|arm64) CF_ARCH="arm64" ;;
                     *) CF_ARCH="amd64" ;;
                 esac
-                curl -L -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+                echo -e "${CYAN}正在下载 cloudflared 组件，请稍候...${PLAIN}"
+                wget --show-progress -qO /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" || curl -L -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
                 chmod +x /usr/local/bin/cloudflared
             fi
             
@@ -550,7 +559,7 @@ modify_config() {
     echo -e "选择: 更改配置\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要更改的配置序号 (输入 0 返回): " idx
+    read -p "请选择要更改的配置序号: " idx
     if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
     if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
@@ -602,7 +611,7 @@ modify_config() {
     cp $CONFIG_FILE ${CONFIG_FILE}.bak
 
     if [ "$action" == "uuid" ]; then
-        read -p "请输入UUID(回车默认随机): " input_uuid
+        read -p "请输入UUID [默认随机]: " input_uuid
         NEW_AUTH=${input_uuid:-$(/usr/local/bin/sing-box generate uuid)}
         echo -e "UUID: ${GREEN}${NEW_AUTH}${PLAIN}"
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].uuid) = "'$NEW_AUTH'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
@@ -610,7 +619,7 @@ modify_config() {
         echo -e "${GREEN}节点 $TAG 的 UUID 已更新！${PLAIN}"
         sleep 2
     elif [ "$action" == "pass" ]; then
-        read -p "请输入密码(回车默认随机): " input_pass
+        read -p "请输入密码 [默认随机]: " input_pass
         NEW_AUTH=${input_pass:-$(/usr/local/bin/sing-box generate uuid)}
         echo -e "密码: ${GREEN}${NEW_AUTH}${PLAIN}"
         jq '(.inbounds[] | select(.tag=="'$TAG'") | .users[0].password) = "'$NEW_AUTH'"' $CONFIG_FILE > $TMP_JSON && mv $TMP_JSON $CONFIG_FILE
@@ -666,7 +675,7 @@ del_config() {
     echo -e "选择: 删除配置\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要删除的配置序号 (输入 0 返回): " idx
+    read -p "请选择要删除的配置序号: " idx
     if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
     if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
@@ -706,7 +715,7 @@ view_single_config() {
     echo -e "选择: 单协议链接\n"
     list_inbounds || { sleep 2; return; }
     echo ""
-    read -p "请选择要查看的配置序号 (输入 0 返回): " idx
+    read -p "请选择要查看的配置序号: " idx
     if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return; fi
     if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "输入错误!"; sleep 1; return; fi
     let idx--
@@ -800,7 +809,7 @@ run_manage() {
         1) 
            local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
            if [ "$INBOUND_COUNT" -eq 0 ]; then
-               echo -e "${RED}当前无任何节点配置，内核启动无意义！请先添加配置。${PLAIN}"; sleep 2; return
+               echo -e "${RED}当前无任何节点配置，请先添加配置。${PLAIN}"; sleep 2; return
            fi
            if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box start; else systemctl start sing-box; fi
            echo -e "${GREEN}已启动${PLAIN}"; sleep 1 ;;
@@ -810,7 +819,7 @@ run_manage() {
         3) 
            local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
            if [ "$INBOUND_COUNT" -eq 0 ]; then
-               echo -e "${RED}当前无任何节点配置，无法重启！请先添加配置。${PLAIN}"; sleep 2; return
+               echo -e "${RED}当前无任何节点配置，请先添加配置。${PLAIN}"; sleep 2; return
            fi
            restart_service; echo -e "${GREEN}已重启${PLAIN}"; sleep 1 ;;
         0) return ;;
@@ -818,23 +827,71 @@ run_manage() {
     esac
 }
 
-update_kernel() {
+update_manage() {
     clear
-    echo -e "${CYAN}正在检查并更新 sing-box 内核...${PLAIN}\n"
-    rm -f /usr/local/bin/sing-box
-    init_base
+    echo -e "${CYAN}正在检查 sing-box 内核新版本，请稍候...${PLAIN}"
+    
+    local CUR_VER="未安装"
     if [ -f "/usr/local/bin/sing-box" ]; then
-        restart_service
-        NEW_VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
-        echo -e "\n${GREEN}内核更新成功！当前版本: ${NEW_VER}${PLAIN}"
-    else
-        echo -e "\n${RED}内核更新失败，请检查网络！${PLAIN}"
+        CUR_VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
     fi
-    read -p "按回车键返回菜单..."
+    
+    local LATEST_TAG=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    local NEW_VER=${LATEST_TAG#v}
+    
+    local SB_UPDATE_TEXT="更新 sing-box 内核"
+    if [ -n "$NEW_VER" ]; then
+        if [ "$CUR_VER" != "$NEW_VER" ]; then
+            SB_UPDATE_TEXT="更新 sing-box 内核 ${GREEN}[发现新版: v${NEW_VER}]${PLAIN}"
+        else
+            SB_UPDATE_TEXT="更新 sing-box 内核 ${YELLOW}[已是最新: v${CUR_VER}]${PLAIN}"
+        fi
+    fi
+
+    clear
+    echo -e "选择: 更新\n"
+    echo -e " 1) ${SB_UPDATE_TEXT}"
+    echo -e " 2) 更新脚本"
+    echo -e " 0) 返回\n"
+    read -p "请选择 [0-2]: " up_idx
+    
+    case "$up_idx" in
+        1)
+            if [ -z "$NEW_VER" ]; then
+                echo -e "${RED}获取最新版本信息失败，请检查网络！${PLAIN}"
+                sleep 2; return
+            fi
+            if [ "$CUR_VER" == "$NEW_VER" ]; then
+                echo -e "\n${GREEN}当前已是最新版本 v${CUR_VER}，无需更新！${PLAIN}"
+                sleep 2; return
+            fi
+            
+            echo -e "\n${YELLOW}即将更新内核至 v${NEW_VER}...${PLAIN}"
+            rm -f /usr/local/bin/sing-box
+            init_base
+            if [ -f "/usr/local/bin/sing-box" ]; then
+                restart_service
+                LATEST_VER_CACHE="$NEW_VER"
+                echo -e "\n${GREEN}内核更新成功！当前版本: v${NEW_VER}${PLAIN}"
+            else
+                echo -e "\n${RED}内核更新失败，请检查网络！${PLAIN}"
+            fi
+            read -p "按回车键返回菜单..."
+            ;;
+        2)
+            echo -e "\n${CYAN}正在拉取最新脚本代码...${PLAIN}"
+            curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
+            chmod +x /usr/local/bin/sb
+            echo -e "${GREEN}脚本代码更新成功！请重新运行 sb 命令进入面板。${PLAIN}"
+            exit 0
+            ;;
+        0) return ;;
+        *) echo "输入错误!"; sleep 1 ;;
+    esac
 }
 
 uninstall_all() {
-    read -p "确认卸载并删除所有已创建的节点配置吗? (y/n): " un
+    read -p "确认删除脚本,sing-box,和所有节点配置吗？(y/n): " un
     if [[ "$un" == "y" ]]; then
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service sing-box stop 2>/dev/null
@@ -857,13 +914,16 @@ uninstall_all() {
         
         rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb /etc/sing-box
         rm -f /var/run/sing-box.pid /var/run/cloudflared.pid $TMP_JSON
-        echo -e "${GREEN}已彻底卸载，并完全清理了所有节点配置与相关残留文件！${PLAIN}"
-        exit 0
+        echo -e "${GREEN}已彻底卸载！${PLAIN}"
     fi
 }
 
 menu() {
     init_base
+    
+    local LATEST_TAG=$(curl -s -m 2 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    LATEST_VER_CACHE=${LATEST_TAG#v}
+
     while true; do
         clear
         if [ "$OS_TYPE" == "alpine" ]; then
@@ -873,10 +933,21 @@ menu() {
             SB_STATUS=$(systemctl is-active sing-box 2>/dev/null)
         fi
         [ "$SB_STATUS" == "active" ] && ST_COLOR=$GREEN || ST_COLOR=$RED
+        
         VER=$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
         
-        echo -e "------------- sing-box 综合管理脚本 -------------"
-        echo -e "sing-box ${VER:-未安装}: ${ST_COLOR}${SB_STATUS}${PLAIN}"
+        if [ -n "$VER" ]; then
+            if [ -n "$LATEST_VER_CACHE" ] && [ "$VER" != "$LATEST_VER_CACHE" ]; then
+                VER_SHOW="${VER} ${YELLOW}[新版: ${LATEST_VER_CACHE}]${PLAIN}"
+            else
+                VER_SHOW="${VER}"
+            fi
+        else
+            VER_SHOW="未安装"
+        fi
+        
+        echo -e "------------- sing-box 管理脚本 -------------"
+        echo -e "sing-box ${VER_SHOW}: ${ST_COLOR}${SB_STATUS}${PLAIN}"
         echo -e ""
         echo -e " 1) 添加配置"
         echo -e " 2) 更改配置"
@@ -884,7 +955,7 @@ menu() {
         echo -e " 4) 查看配置"
         echo -e " 5) 证书管理"
         echo -e " 6) 运行管理"
-        echo -e " 7) 更新内核"
+        echo -e " 7) 更新"
         echo -e " 8) 卸载"
         echo -e " 0) 退出"
         echo -e ""
@@ -897,12 +968,51 @@ menu() {
             4) view_config ;;
             5) cert_manage ;;
             6) run_manage ;;
-            7) update_kernel ;;
-            8) uninstall_all ;;
+            7) update_manage ;;
+            8) uninstall_all; exit 0 ;;
             0) exit 0 ;;
             *) echo "输入错误!"; sleep 1 ;;
         esac
     done
 }
+
+if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" ]]; then
+    if [ -f "/usr/local/bin/sb" ]; then
+        clear
+        echo -e "${GREEN}检测到 sing-box 管理脚本已经安装！${PLAIN}\n"
+        echo -e " 1. 更新覆盖脚本"
+        echo -e " 2. 卸载脚本"
+        echo -e " 3. 进入面板"
+        echo -e " 4. 退出"
+        echo ""
+        read -p "请选择 [1-4]: " pre_choice
+        case "$pre_choice" in
+            1)
+                echo -e "${CYAN}正在拉取最新脚本代码...${PLAIN}"
+                curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
+                chmod +x /usr/local/bin/sb
+                echo -e "${GREEN}脚本代码更新成功！请执行 sb 命令进入面板。${PLAIN}"
+                exit 0
+                ;;
+            2)
+                uninstall_all
+                exit 0
+                ;;
+            3)
+                ;;
+            *)
+                exit 0
+                ;;
+        esac
+    else
+        echo -e "${CYAN}==> 正在将管理脚本写入到全局环境...${PLAIN}"
+        curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
+        chmod +x /usr/local/bin/sb
+        rm -f sb.sh install.sh 2>/dev/null
+        
+        echo -e "\n${GREEN}==> 脚本安装完成！以后可随时输入 ${YELLOW}sb${GREEN} 快捷调用本面板。${PLAIN}"
+        sleep 2
+    fi
+fi
 
 menu
