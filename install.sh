@@ -553,7 +553,7 @@ get_unique_tag() {
 select_inbound() {
     TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' $CONFIG_FILE))
     if [ ${#TAGS[@]} -eq 0 ]; then
-        echo -e "${RED}当前没有发现任何配置！${PLAIN}"
+        echo -e "${RED}未添加节点配置！${PLAIN}"
         sleep 2
         return 1
     fi
@@ -1011,7 +1011,7 @@ show_all_links() {
     TAGS=($(jq -r '.inbounds[] | select(.tag != null and .tag != "dns-in") | .tag' $CONFIG_FILE))
     
     if [ ${#TAGS[@]} -eq 0 ]; then
-        echo -e "\n${RED}当前没有发现任何配置！${PLAIN}"
+        echo -e "\n${RED}未添加节点配置！${PLAIN}"
         echo -e "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
         sleep 2
         return
@@ -1052,9 +1052,9 @@ run_manage() {
     read -p "请选择 [0-3]: " run_idx
     case "$run_idx" in
         1) 
-           local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
-           if [ "$INBOUND_COUNT" -eq 0 ]; then
-               echo -e "${RED}当前无任何节点配置，请先添加配置。${PLAIN}"; sleep 2; return
+           local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE 2>/dev/null)
+           if [ -z "$INBOUND_COUNT" ] || [ "$INBOUND_COUNT" -eq 0 ]; then
+               echo -e "${RED}未添加节点配置！请先添加配置。${PLAIN}"; sleep 2; return
            fi
            if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box start; else systemctl start sing-box; fi
            echo -e "${GREEN}已启动${PLAIN}"; sleep 1 ;;
@@ -1062,9 +1062,9 @@ run_manage() {
            if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box stop; else systemctl stop sing-box; fi
            echo -e "${GREEN}已停止${PLAIN}"; sleep 1 ;;
         3) 
-           local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
-           if [ "$INBOUND_COUNT" -eq 0 ]; then
-               echo -e "${RED}当前无任何节点配置，请先添加配置。${PLAIN}"; sleep 2; return
+           local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE 2>/dev/null)
+           if [ -z "$INBOUND_COUNT" ] || [ "$INBOUND_COUNT" -eq 0 ]; then
+               echo -e "${RED}未添加节点配置！请先添加配置。${PLAIN}"; sleep 2; return
            fi
            restart_service; echo -e "${GREEN}已重启${PLAIN}"; sleep 1 ;;
         0) return ;;
@@ -1234,13 +1234,42 @@ menu() {
 }
 
 if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" ]]; then
-    echo -e "${CYAN}==> 正在将管理脚本写入到全局环境...${PLAIN}"
-    curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
-    chmod +x /usr/local/bin/sb
-    rm -f sb.sh install.sh 2>/dev/null
-    
-    echo -e "\n${GREEN}==> 脚本安装完成！以后可随时输入 ${YELLOW}sb${GREEN} 快捷调用本面板。${PLAIN}"
-    sleep 2
+    if [ -f "/usr/local/bin/sb" ]; then
+        clear
+        echo -e "${GREEN}检测到 sing-box 管理脚本已经安装！${PLAIN}\n"
+        echo -e " 1. 更新覆盖脚本"
+        echo -e " 2. 卸载脚本"
+        echo -e " 3. 进入面板"
+        echo -e " 4. 退出"
+        echo ""
+        read -p "请选择 [1-4]: " pre_choice
+        case "$pre_choice" in
+            1)
+                echo -e "${CYAN}正在拉取最新脚本代码...${PLAIN}"
+                curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
+                chmod +x /usr/local/bin/sb
+                echo -e "${GREEN}脚本代码更新成功！请执行 sb 命令进入面板。${PLAIN}"
+                exit 0
+                ;;
+            2)
+                uninstall_all
+                exit 0
+                ;;
+            3)
+                ;;
+            *)
+                exit 0
+                ;;
+        esac
+    else
+        echo -e "${CYAN}==> 正在将管理脚本写入到全局环境...${PLAIN}"
+        curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o /usr/local/bin/sb
+        chmod +x /usr/local/bin/sb
+        rm -f sb.sh install.sh 2>/dev/null
+        
+        echo -e "\n${GREEN}==> 脚本安装完成！以后可随时输入 ${YELLOW}sb${GREEN} 快捷调用本面板。${PLAIN}"
+        sleep 2
+    fi
 fi
 
 menu
