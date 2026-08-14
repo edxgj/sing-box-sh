@@ -314,13 +314,13 @@ check_cert() {
     load_secrets
     if [ -f "$CERT_DIR/fullchain.cer" ] && [ -f "$CERT_DIR/private.key" ]; then return 0; fi
     
-    echo -e "${YELLOW}当前节点协议强制需要使用 TLS 加密！${PLAIN}"
-    read -p "是否申请真实域名证书? (y/n) [默认: y]: " apply_cert
+    echo -e "${YELLOW}当前节点协议需要使用 TLS 加密！${PLAIN}"
+    read -p "是否申请域名证书? (y/n) [默认: y]: " apply_cert
     apply_cert=${apply_cert:-y}
 
     if [[ "$apply_cert" == "y" ]]; then
         echo -e "${CYAN}准备自动调用证书申请...${PLAIN}"
-        read -p "请输入你的真实域名: " DOMAIN
+        read -p "请输入你的域名: " DOMAIN
         read -p "请输入 Cloudflare 邮箱: " CF_Email
         read -p "请输入 Cloudflare Global API Key: " CF_Key
         save_secret "DOMAIN" "$DOMAIN"
@@ -339,7 +339,7 @@ check_cert() {
         fi
         ~/.acme.sh/acme.sh --installcert -d ${DOMAIN} --fullchainpath $CERT_DIR/fullchain.cer --keypath $CERT_DIR/private.key --reloadcmd "$RELOAD_CMD"
         chmod -R 755 $CERT_DIR
-        echo -e "${GREEN}真实域名证书申请成功！${PLAIN}"
+        echo -e "${GREEN}域名证书申请成功！${PLAIN}"
     else
         echo -e "${CYAN}准备生成自签名证书...${PLAIN}"
         read -p "请输入伪装域名 [默认: bing.com]: " DOMAIN
