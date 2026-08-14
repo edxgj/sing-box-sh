@@ -576,9 +576,9 @@ add_config() {
     echo -e "请选择协议:\n"
     echo -e " 1) VLESS-REALITY"
     echo -e " 2) Hysteria2"
-    echo -e " 3) TUIC v5"
+    echo -e " 3) TUIC"
     echo -e " 4) AnyTLS"
-    echo -e " 5) VLESS-WS (Argo)"
+    echo -e " 5) VLESS-Argo"
     echo -e " 0) 返回\n"
     read -p "请选择 [0-5]: " proto_idx
 
