@@ -1397,14 +1397,14 @@ menu() {
         
         echo -e "------------- sing-box 管理脚本 -------------"
         echo -e "sing-box ${VER_SHOW}: ${ST_COLOR}${SB_STATUS}${PLAIN}\n"
-        echo -e " 1) 添加节点配置"
-        echo -e " 2) 更改节点配置"
-        echo -e " 3) 删除节点配置"
-        echo -e " 4) 查看节点配置"
-        echo -e " 5) 证书管理中心"
+        echo -e " 1) 添加节点"
+        echo -e " 2) 更改节点"
+        echo -e " 3) 删除节点"
+        echo -e " 4) 查看节点"
+        echo -e " 5) 证书管理"
         echo -e " 6) 运行管理"
-        echo -e " 7) 检查更新"
-        echo -e " 8) 卸载全部组件"
+        echo -e " 7) 更新"
+        echo -e " 8) 卸载"
         echo -e " 0) 退出\n"
         read -p "请选择 [0-8]: " choice
 
