@@ -12,7 +12,7 @@ CERT_DIR="$CONFIG_DIR/cert"
 SECRETS_FILE="$CONFIG_DIR/.secrets"
 FW_PORTS_FILE="$CONFIG_DIR/.fw_ports"
 
-TMP_JSON=$(mktemp /tmp/sb_tmp.XXXXXX.json)
+TMP_JSON=$(mktemp /tmp/sb_tmp_json.XXXXXX)
 trap 'rm -f $TMP_JSON' EXIT
 trap 'rm -f $TMP_JSON; exit 1' INT TERM
 
