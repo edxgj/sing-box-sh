@@ -12,7 +12,7 @@ CERT_DIR="$CONFIG_DIR/cert"
 SECRETS_FILE="$CONFIG_DIR/.secrets"
 FW_PORTS_FILE="$CONFIG_DIR/.fw_ports"
 
-TMP_JSON=$(mktemp /tmp/sb_tmp_json.XXXXXX)
+TMP_JSON=$(mktemp /tmp/sb_tmp.XXXXXX.json)
 trap 'rm -f $TMP_JSON' EXIT
 trap 'rm -f $TMP_JSON; exit 1' INT TERM
 
@@ -51,6 +51,9 @@ get_ip() {
 get_latest_version() {
     mkdir -p "$CONFIG_DIR" 2>/dev/null
     local CACHE_FILE="$CONFIG_DIR/.version_cache"
+    # 追溯性收紧旧版缓存文件的权限
+    [ -f "$CACHE_FILE" ] && chmod 600 "$CACHE_FILE" 2>/dev/null
+    
     local CACHE_TTL=3600
     local NOW=$(date +%s)
 
@@ -70,6 +73,7 @@ get_latest_version() {
             GLOBAL_LATEST_VER=${res#v}
             echo "$NOW" > "$CACHE_FILE"
             echo "$GLOBAL_LATEST_VER" >> "$CACHE_FILE"
+            chmod 600 "$CACHE_FILE" 2>/dev/null
         fi
     fi
     echo "$GLOBAL_LATEST_VER"
@@ -353,16 +357,24 @@ EOF
 }
 
 get_domain() {
-    local val
     local prompt="$1"
     local default="$2"
+    local allow_colon="${3:-false}"
+    local pattern='^[a-zA-Z0-9.-]+$'
+    [ "$allow_colon" == "true" ] && pattern='^[a-zA-Z0-9:.-]+$'
+    
+    local val
     while true; do
         read -p "$prompt [默认: $default]: " val >&2
         val=${val:-$default}
-        if [[ "$val" =~ ^[a-zA-Z0-9:.-]+$ ]] && [[ "$val" =~ [a-zA-Z0-9] ]]; then
+        if [[ "$val" =~ $pattern ]] && [[ "$val" =~ [a-zA-Z0-9] ]]; then
             break
         else
-            echo -e "${RED}错误：格式不正确！必须包含字母或数字，且不得包含空格或危险符号。${PLAIN}" >&2
+            if [ "$allow_colon" == "true" ]; then
+                echo -e "${RED}错误：格式不正确！必须包含字母或数字，且不得包含空格或特殊符号。${PLAIN}" >&2
+            else
+                echo -e "${RED}错误：格式不正确！纯域名不支持冒号，且必须包含字母或数字。${PLAIN}" >&2
+            fi
         fi
     done
     echo "$val"
@@ -394,7 +406,13 @@ apply_real_cert() {
     else
         read -s -p "请输入 Cloudflare Global API Key: " NEW_CF_Key >&2
         echo "" >&2
-        read -p "请输入 Cloudflare 邮箱: " NEW_CF_Email >&2
+        local NEW_CF_Email=""
+        while true; do
+            read -p "请输入 Cloudflare 邮箱: " NEW_CF_Email >&2
+            if [[ "$NEW_CF_Email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then break; fi
+            echo -e "${RED}错误：邮箱格式不正确，请重新输入！${PLAIN}" >&2
+        done
+        
         if ! CF_Key="${NEW_CF_Key}" CF_Email="${NEW_CF_Email}" ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${NEW_DOMAIN}; then
             echo -e "${RED}申请失败！请检查 CF API 是否正确。${PLAIN}"
             return 1
@@ -541,7 +559,7 @@ get_pass() {
     while true; do
         read -p "请输入密码(支持特殊符号,会自动安全编码) [默认随机]: " val >&2
         val=${val:-$(/usr/local/bin/sing-box generate rand --hex 16)}
-        if [[ -n "${val// /}" ]]; then
+        if [[ "$val" =~ [^[:space:]] ]]; then
             break
         else
             echo -e "${RED}错误：密码不能全为空白字符！${PLAIN}" >&2
@@ -660,7 +678,8 @@ print_config_detail() {
                 local SID=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.short_id[0]' $CONFIG_FILE)
                 local var_name="REALITY_PUB_${PORT}"
                 local PUB="${!var_name}"
-                echo -e "地址 (address)\t\t\t= ${IP:-[获取公网IP失败]}"
+                local IP_DISP=$(wrap_ipv6 "$IP")
+                echo -e "地址 (address)\t\t\t= ${IP_DISP:-[获取公网IP失败]}"
                 echo -e "端口 (port)\t\t\t= $PORT"
                 echo -e "用户ID (id)\t\t\t= $AUTH"
                 echo -e "流控 (flow)\t\t\t= xtls-rprx-vision"
@@ -673,7 +692,8 @@ print_config_detail() {
                 local var_dom="ARGO_DOMAIN_${PORT}"
                 local A_IP="${!var_ip}"
                 local A_DOM="${!var_dom}"
-                echo -e "地址 (address)\t\t\t= $A_IP"
+                local A_IP_DISP=$(wrap_ipv6 "$A_IP")
+                echo -e "地址 (address)\t\t\t= $A_IP_DISP"
                 echo -e "端口 (port)\t\t\t= 443"
                 echo -e "用户ID (id)\t\t\t= $AUTH"
                 echo -e "传输协议 (network)\t\t= ws"
@@ -685,7 +705,8 @@ print_config_detail() {
             ;;
         hysteria2)
             local AUTH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password' $CONFIG_FILE)
-            echo -e "地址 (address)\t\t\t= ${CONN_ADDR:-[获取目标地址失败]}"
+            local CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
             echo -e "密码 (password)\t\t\t= $AUTH"
             echo -e "传输层安全 (TLS)\t\t= tls"
@@ -696,7 +717,8 @@ print_config_detail() {
         tuic)
             local T_UUID=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].uuid' $CONFIG_FILE)
             local T_PASS=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password' $CONFIG_FILE)
-            echo -e "地址 (address)\t\t\t= ${CONN_ADDR:-[获取目标地址失败]}"
+            local CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
             echo -e "用户ID (id)\t\t\t= $T_UUID"
             echo -e "密码 (password)\t\t\t= $T_PASS"
@@ -708,7 +730,8 @@ print_config_detail() {
             ;;
         anytls)
             local AUTH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password' $CONFIG_FILE)
-            echo -e "地址 (address)\t\t\t= ${CONN_ADDR:-[获取目标地址失败]}"
+            local CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
             echo -e "密码 (password)\t\t\t= $AUTH"
             echo -e "传输层安全 (TLS)\t\t= tls"
@@ -859,15 +882,18 @@ add_config() {
         5)
             IS_ARGO=1
             local UUID=$(get_uuid)
-            local ARGO_IP=$(get_domain "请输入 Argo 优选域名/IP" "saas.sin.fan")
+            local ARGO_IP=$(get_domain "请输入 Argo 优选域名/IP" "saas.sin.fan" "true")
             local ARGO_DOMAIN=$(get_domain "请输入 Argo 隧道域名" "example.com")
             
             local ARGO_TOKEN=""
             while true; do
                 read -s -p "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN >&2
                 echo "" >&2
-                if [[ "$ARGO_TOKEN" =~ ^[A-Za-z0-9_.=-]+$ ]]; then break; fi
-                echo -e "${RED}错误：Token 格式不正确或为空！仅允许字母、数字及 . = - _ 等合法字符。${PLAIN}" >&2
+                # 注：正则特意限制为 Base64/Base64URL 字符集，
+                # 严防引入 % (避免 systemd specifier 展开污染) 
+                # 以及 $ ` " (避免 OpenRC shell 变量截断和命令注入)
+                if [[ "$ARGO_TOKEN" =~ ^[A-Za-z0-9+/=._-]+$ ]]; then break; fi
+                echo -e "${RED}错误：Token 格式不正确或为空！${PLAIN}" >&2
             done
             
             save_secret "ARGO_IP_${PORT}" "$ARGO_IP"
@@ -1397,14 +1423,14 @@ menu() {
         
         echo -e "------------- sing-box 管理脚本 -------------"
         echo -e "sing-box ${VER_SHOW}: ${ST_COLOR}${SB_STATUS}${PLAIN}\n"
-        echo -e " 1) 添加节点"
-        echo -e " 2) 更改节点"
-        echo -e " 3) 删除节点"
-        echo -e " 4) 查看节点"
-        echo -e " 5) 证书管理"
+        echo -e " 1) 添加节点配置"
+        echo -e " 2) 更改节点配置"
+        echo -e " 3) 删除节点配置"
+        echo -e " 4) 查看节点配置"
+        echo -e " 5) 证书管理中心"
         echo -e " 6) 运行管理"
-        echo -e " 7) 更新"
-        echo -e " 8) 卸载"
+        echo -e " 7) 检查更新"
+        echo -e " 8) 卸载全部组件"
         echo -e " 0) 退出\n"
         read -p "请选择 [0-8]: " choice
 
