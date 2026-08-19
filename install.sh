@@ -12,7 +12,7 @@ CERT_DIR="$CONFIG_DIR/cert"
 SECRETS_FILE="$CONFIG_DIR/.secrets"
 FW_PORTS_FILE="$CONFIG_DIR/.fw_ports"
 
-TMP_JSON=$(mktemp /tmp/sb_tmp.XXXXXX.json)
+TMP_JSON=$(mktemp)
 trap 'rm -f $TMP_JSON' EXIT
 trap 'rm -f $TMP_JSON; exit 1' INT TERM
 
@@ -43,7 +43,16 @@ GLOBAL_LATEST_VER=""
 
 get_ip() {
     if [ -z "$GLOBAL_IP" ]; then
-        GLOBAL_IP=$(curl -s -m 5 https://ipv4.icanhazip.com)
+        local ip
+        ip=$(curl -s -m 5 https://ipv4.icanhazip.com)
+        if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            GLOBAL_IP="$ip"
+        else
+            ip=$(curl -s -m 5 https://ipv6.icanhazip.com)
+            if [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+                GLOBAL_IP="$ip"
+            fi
+        fi
     fi
     echo "$GLOBAL_IP"
 }
@@ -51,7 +60,6 @@ get_ip() {
 get_latest_version() {
     mkdir -p "$CONFIG_DIR" 2>/dev/null
     local CACHE_FILE="$CONFIG_DIR/.version_cache"
-    # 追溯性收紧旧版缓存文件的权限
     [ -f "$CACHE_FILE" ] && chmod 600 "$CACHE_FILE" 2>/dev/null
     
     local CACHE_TTL=3600
@@ -149,7 +157,7 @@ open_fw_port() {
 
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then
         fw_found=1
-        ufw allow ${port}/${proto} comment 'sb-sh' >/dev/null 2>&1 && success=1
+        ufw allow ${port}/${proto} >/dev/null 2>&1 && success=1
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         fw_found=1
         firewall-cmd --add-port=${port}/${proto} --permanent >/dev/null 2>&1
@@ -271,7 +279,7 @@ init_base() {
         VERSION=$(get_latest_version)
         
         if [ -z "$VERSION" ]; then
-            echo -e "${YELLOW}获取版本信息失败 (可能触发了 GitHub API 限流)！${PLAIN}"
+            echo -e "${YELLOW}获取版本信息失败！${PLAIN}"
             read -p "请手动输入要安装的 sing-box 版本号 (例如 1.10.1): " VERSION
             if [ -z "$VERSION" ]; then
                 echo -e "${RED}未输入版本号，安装终止。${PLAIN}"
@@ -404,8 +412,14 @@ apply_real_cert() {
             return 1
         fi
     else
-        read -s -p "请输入 Cloudflare Global API Key: " NEW_CF_Key >&2
-        echo "" >&2
+        local NEW_CF_Key=""
+        while true; do
+            read -s -p "请输入 Cloudflare Global API Key: " NEW_CF_Key >&2
+            echo "" >&2
+            if [[ "$NEW_CF_Key" =~ ^[A-Za-z0-9]+$ ]]; then break; fi
+            echo -e "${RED}错误：API Key 格式不正确！${PLAIN}" >&2
+        done
+        
         local NEW_CF_Email=""
         while true; do
             read -p "请输入 Cloudflare 邮箱: " NEW_CF_Email >&2
@@ -453,8 +467,8 @@ generate_self_cert() {
     save_secret "SELF_DOMAIN" "$NEW_DOMAIN"
     
     echo -e "${CYAN}正在生成自签名证书...${PLAIN}"
-    if ! openssl req -x509 -nodes -days 36500 -newkey rsa:2048 \
-        -keyout $CERT_DIR/self.key -out $CERT_DIR/self.cer -subj "/CN=${NEW_DOMAIN}"; then
+    if ! ( umask 077; openssl req -x509 -nodes -days 36500 -newkey rsa:2048 \
+        -keyout $CERT_DIR/self.key -out $CERT_DIR/self.cer -subj "/CN=${NEW_DOMAIN}" ); then
         echo -e "${RED}生成自签名证书失败！请查看上方报错信息。${PLAIN}"
         rm -f $CERT_DIR/self.key $CERT_DIR/self.cer
         return 1
@@ -862,20 +876,20 @@ add_config() {
             ;;
         2)
             local PASS=$(get_pass)
-            if ! prompt_cert_type; then return; fi
+            if ! prompt_cert_type; then rm -f ${CONFIG_FILE}.bak; return; fi
             jq --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" \
             '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
             ;;
         3)
             local UUID=$(get_uuid)
             local PASS=$(get_pass)
-            if ! prompt_cert_type; then return; fi
+            if ! prompt_cert_type; then rm -f ${CONFIG_FILE}.bak; return; fi
             jq --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" \
             '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
             ;;
         4)
             local PASS=$(get_pass)
-            if ! prompt_cert_type; then return; fi
+            if ! prompt_cert_type; then rm -f ${CONFIG_FILE}.bak; return; fi
             jq --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" \
             '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h2","http/1.1"],"certificate_path":$cert,"key_path":$key}}]' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
             ;;
@@ -889,9 +903,6 @@ add_config() {
             while true; do
                 read -s -p "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN >&2
                 echo "" >&2
-                # 注：正则特意限制为 Base64/Base64URL 字符集，
-                # 严防引入 % (避免 systemd specifier 展开污染) 
-                # 以及 $ ` " (避免 OpenRC shell 变量截断和命令注入)
                 if [[ "$ARGO_TOKEN" =~ ^[A-Za-z0-9+/=._-]+$ ]]; then break; fi
                 echo -e "${RED}错误：Token 格式不正确或为空！${PLAIN}" >&2
             done
@@ -1052,6 +1063,8 @@ modify_config() {
                 else
                     echo -e "${GREEN}节点 $TAG 的证书已更新！${PLAIN}"; rm -f ${CONFIG_FILE}.bak
                 fi
+            else
+                rm -f ${CONFIG_FILE}.bak
             fi
             read -p "按回车键返回上一级..."
             
@@ -1105,7 +1118,7 @@ modify_config() {
                 
                 if [ -n "$f_proto" ]; then
                     close_fw_port "$OLD_PORT" "$f_proto"
-                    sed -i "|^${OLD_PORT}/${f_proto}$|d" "$FW_PORTS_FILE" 2>/dev/null
+                    sed -i "\\|^${OLD_PORT}/${f_proto}\$|d" "$FW_PORTS_FILE" 2>/dev/null
                     read -p "是否自动放行新端口？(y/n) [默认: y]: " auto_fw
                     if [[ "${auto_fw:-y}" == "y" || "${auto_fw:-y}" == "Y" ]]; then open_fw_port "$NEW_PORT" "$f_proto"; fi
                 fi
@@ -1194,7 +1207,7 @@ del_config() {
 
         if [ -n "$f_proto" ]; then
             close_fw_port "$PORT" "$f_proto"
-            sed -i "|^${PORT}/${f_proto}$|d" "$FW_PORTS_FILE" 2>/dev/null
+            sed -i "\\|^${PORT}/${f_proto}\$|d" "$FW_PORTS_FILE" 2>/dev/null
         fi
         
         if [ "$IS_ARGO" -eq 1 ]; then
@@ -1412,7 +1425,7 @@ menu() {
         fi
         [ "$SB_STATUS" == "active" ] && ST_COLOR=$GREEN || ST_COLOR=$RED
         
-        VER=$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
         if [ -n "$VER" ]; then
             if [ -n "$GLOBAL_LATEST_VER" ] && [ "$VER" != "$GLOBAL_LATEST_VER" ]; then VER_SHOW="${VER} ${YELLOW}[新版: ${GLOBAL_LATEST_VER}]${PLAIN}"
             else VER_SHOW="${VER}"
@@ -1423,7 +1436,7 @@ menu() {
         
         echo -e "------------- sing-box 管理脚本 -------------"
         echo -e "sing-box ${VER_SHOW}: ${ST_COLOR}${SB_STATUS}${PLAIN}\n"
-        echo -e " 1) 添加节点"
+        echo -e " 1) 添加节点配置"
         echo -e " 2) 更改节点"
         echo -e " 3) 删除节点"
         echo -e " 4) 查看节点"
