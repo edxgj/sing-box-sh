@@ -1436,7 +1436,7 @@ menu() {
         
         echo -e "------------- sing-box 管理脚本 -------------"
         echo -e "sing-box ${VER_SHOW}: ${ST_COLOR}${SB_STATUS}${PLAIN}\n"
-        echo -e " 1) 添加节点配置"
+        echo -e " 1) 添加节点"
         echo -e " 2) 更改节点"
         echo -e " 3) 删除节点"
         echo -e " 4) 查看节点"
