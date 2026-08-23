@@ -900,8 +900,7 @@ add_config() {
             
             local ARGO_TOKEN=""
             while true; do
-                read -s -p "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN >&2
-                echo "" >&2
+                read -p "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN >&2
                 if [[ "$ARGO_TOKEN" =~ ^[A-Za-z0-9+/=._-]+$ ]]; then break; fi
                 echo -e "${RED}错误：Token 格式不正确或为空！${PLAIN}" >&2
             done
