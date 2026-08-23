@@ -414,8 +414,7 @@ apply_real_cert() {
     else
         local NEW_CF_Key=""
         while true; do
-            read -s -p "请输入 Cloudflare Global API Key: " NEW_CF_Key >&2
-            echo "" >&2
+            read -p "请输入 Cloudflare Global API Key: " NEW_CF_Key >&2
             if [[ "$NEW_CF_Key" =~ ^[A-Za-z0-9]+$ ]]; then break; fi
             echo -e "${RED}错误：API Key 格式不正确！${PLAIN}" >&2
         done
