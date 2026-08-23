@@ -407,7 +407,7 @@ apply_real_cert() {
 
     if [ "$v_mode" == "1" ]; then
         open_fw_port 80 tcp >/dev/null
-        if ! ~/.acme.sh/acme.sh --issue -d ${NEW_DOMAIN} --standalone; then
+        if ! ~/.acme.sh/acme.sh --issue -d ${NEW_DOMAIN} --standalone --force; then
             echo -e "${RED}申请失败！请检查域名解析和 80 端口是否连通。${PLAIN}"
             return 1
         fi
@@ -427,7 +427,7 @@ apply_real_cert() {
             echo -e "${RED}错误：邮箱格式不正确，请重新输入！${PLAIN}" >&2
         done
         
-        if ! CF_Key="${NEW_CF_Key}" CF_Email="${NEW_CF_Email}" ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${NEW_DOMAIN}; then
+        if ! CF_Key="${NEW_CF_Key}" CF_Email="${NEW_CF_Email}" ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${NEW_DOMAIN} --force; then
             echo -e "${RED}申请失败！请检查 CF API 是否正确。${PLAIN}"
             return 1
         fi
