@@ -313,6 +313,17 @@ init_base() {
     else
         sed -i 's/"geoip":"private"/"ip_is_private":true/g' $CONFIG_FILE
         sed -i 's/"geoip": "private"/"ip_is_private": true/g' $CONFIG_FILE
+        
+        local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        if [ -n "$SB_VER" ]; then
+            local major=$(echo "$SB_VER" | cut -d. -f1)
+            local minor=$(echo "$SB_VER" | cut -d. -f2)
+            if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
+                if grep -q '"domain_strategy"' $CONFIG_FILE; then
+                    jq '(.outbounds[] | select(has("domain_strategy"))) |= (.domain_resolver = {"strategy": .domain_strategy} | del(.domain_strategy))' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                fi
+            fi
+        fi
     fi
     migrate_certs
 }
@@ -1409,7 +1420,7 @@ EOF
 config_outbound() {
     while true; do
         clear
-        local current_strategy=$(jq -r '.outbounds[] | select(.tag=="direct") | .domain_strategy // "auto"' $CONFIG_FILE 2>/dev/null)
+        local current_strategy=$(jq -r '.outbounds[] | select(.tag=="direct") | (.domain_resolver.strategy // .domain_strategy // "auto")' $CONFIG_FILE 2>/dev/null)
         echo -e "选择: 配置出站 IPv4/IPv6 策略"
         echo -e "当前出站策略: ${GREEN}${current_strategy}${PLAIN}\n"
         echo -e " 1) 仅 IPv4 出站 (ipv4_only)"
@@ -1418,18 +1429,38 @@ config_outbound() {
         echo -e " 0) 返回\n"
         read -p "请选择 [0-3]: " out_idx
         
+        local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        local USE_NEW_FORMAT=0
+        if [ -n "$SB_VER" ]; then
+            local major=$(echo "$SB_VER" | cut -d. -f1)
+            local minor=$(echo "$SB_VER" | cut -d. -f2)
+            if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
+                USE_NEW_FORMAT=1
+            fi
+        else
+            USE_NEW_FORMAT=1
+        fi
+        
         case "$out_idx" in
             1)
                 cp $CONFIG_FILE ${CONFIG_FILE}.bak
-                jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv4_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                if [ "$USE_NEW_FORMAT" -eq 1 ]; then
+                    jq '(.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"strategy": "ipv4_only"})' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                else
+                    jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv4_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                fi
                 ;;
             2)
                 cp $CONFIG_FILE ${CONFIG_FILE}.bak
-                jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv6_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                if [ "$USE_NEW_FORMAT" -eq 1 ]; then
+                    jq '(.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"strategy": "ipv6_only"})' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                else
+                    jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv6_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                fi
                 ;;
             3)
                 cp $CONFIG_FILE ${CONFIG_FILE}.bak
-                jq '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy)' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                jq '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver)' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
                 ;;
             0) return ;;
             *) echo -e "${RED}输入错误!${PLAIN}"; sleep 1; continue ;;
