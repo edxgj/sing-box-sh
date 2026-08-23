@@ -1028,13 +1028,21 @@ modify_config() {
         
         local action=""
         if [ "$TYPE" == "vless" ]; then
+            local IS_REALITY=0
+            if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1; then IS_REALITY=1; fi
             echo -e " 1) 更改 UUID"
             echo -e " 2) 更改端口"
             echo -e " 3) 更改节点名称"
+            [ "$IS_REALITY" -eq 1 ] && echo -e " 4) 更改伪装域名"
             echo -e " 0) 返回"
             while true; do
-                read -p "请选择 [0-3]: " mod_idx
-                case "$mod_idx" in 1) action="uuid"; break ;; 2) action="port"; break ;; 3) action="tag"; break ;; 0) break ;; *) echo -e "${RED}错误!${PLAIN}" ;; esac
+                if [ "$IS_REALITY" -eq 1 ]; then
+                    read -p "请选择 [0-4]: " mod_idx
+                    case "$mod_idx" in 1) action="uuid"; break ;; 2) action="port"; break ;; 3) action="tag"; break ;; 4) action="sni"; break ;; 0) break ;; *) echo -e "${RED}错误!${PLAIN}" ;; esac
+                else
+                    read -p "请选择 [0-3]: " mod_idx
+                    case "$mod_idx" in 1) action="uuid"; break ;; 2) action="port"; break ;; 3) action="tag"; break ;; 0) break ;; *) echo -e "${RED}错误!${PLAIN}" ;; esac
+                fi
             done
         elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "anytls" || "$TYPE" == "tuic" ]]; then
             echo -e " 1) 更改主密钥/密码"
@@ -1186,6 +1194,22 @@ modify_config() {
                     fi
                 fi
                 echo -e "${GREEN}节点名称已成功更改为: $NEW_TAG${PLAIN}"
+                rm -f ${CONFIG_FILE}.bak
+            fi
+            read -p "按回车键返回上一级..."
+            
+        elif [ "$action" == "sni" ]; then
+            local NEW_SNI=$(get_domain "请输入新的伪装域名" "apple.com")
+            
+            jq --arg tag "$TAG" --arg sni "$NEW_SNI" \
+            '(.inbounds[] | select(.tag==$tag) | .tls.server_name) = $sni | (.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server) = $sni' \
+            $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            
+            if ! restart_service; then 
+                echo -e "${RED}操作失败，已还原配置！${PLAIN}"
+                mv ${CONFIG_FILE}.bak $CONFIG_FILE
+            else
+                echo -e "${GREEN}伪装域名已成功更改为: $NEW_SNI${PLAIN}"
                 rm -f ${CONFIG_FILE}.bak
             fi
             read -p "按回车键返回上一级..."
@@ -1461,8 +1485,8 @@ config_outbound() {
                 if [ "$USE_NEW_FORMAT" -eq 1 ]; then
                     jq '
                       .dns.servers |= (. // []) |
-                      if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
-                        .dns.servers += [{"tag": "dns-local", "type": "local"}]
+                      if (. | map(select(.tag == "dns-local")) | length == 0) then
+                        . += [{"tag": "dns-local", "type": "local"}]
                       else . end |
                       (.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"server": "dns-local", "strategy": "ipv4_only"})
                     ' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
@@ -1475,8 +1499,8 @@ config_outbound() {
                 if [ "$USE_NEW_FORMAT" -eq 1 ]; then
                     jq '
                       .dns.servers |= (. // []) |
-                      if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
-                        .dns.servers += [{"tag": "dns-local", "type": "local"}]
+                      if (. | map(select(.tag == "dns-local")) | length == 0) then
+                        . += [{"tag": "dns-local", "type": "local"}]
                       else . end |
                       (.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"server": "dns-local", "strategy": "ipv6_only"})
                     ' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
