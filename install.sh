@@ -314,13 +314,15 @@ init_base() {
         sed -i 's/"geoip":"private"/"ip_is_private":true/g' $CONFIG_FILE
         sed -i 's/"geoip": "private"/"ip_is_private": true/g' $CONFIG_FILE
         
-        local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         if [ -n "$SB_VER" ]; then
             local major=$(echo "$SB_VER" | cut -d. -f1)
             local minor=$(echo "$SB_VER" | cut -d. -f2)
-            if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
-                if grep -q '"domain_strategy"' $CONFIG_FILE; then
-                    jq '(.outbounds[] | select(has("domain_strategy"))) |= (.domain_resolver = {"strategy": .domain_strategy} | del(.domain_strategy))' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]]; then
+                if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
+                    if grep -q '"domain_strategy"' $CONFIG_FILE; then
+                        jq '(.outbounds[] | select(has("domain_strategy"))) |= (.domain_resolver = {"strategy": .domain_strategy} | del(.domain_strategy))' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                    fi
                 fi
             fi
         fi
@@ -1326,7 +1328,10 @@ update_manage() {
         clear
         echo -e "${CYAN}正在检查更新，请稍候...${PLAIN}"
         local CUR_VER="未安装"
-        if [ -f "/usr/local/bin/sing-box" ]; then CUR_VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}'); fi
+        if [ -f "/usr/local/bin/sing-box" ]; then
+            local extracted_ver=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+            [ -n "$extracted_ver" ] && CUR_VER="$extracted_ver"
+        fi
         local NEW_VER=$(get_latest_version)
         local SB_UPDATE_TEXT="更新 sing-box 内核"
         if [ -n "$NEW_VER" ]; then
@@ -1429,13 +1434,15 @@ config_outbound() {
         echo -e " 0) 返回\n"
         read -p "请选择 [0-3]: " out_idx
         
-        local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         local USE_NEW_FORMAT=0
         if [ -n "$SB_VER" ]; then
             local major=$(echo "$SB_VER" | cut -d. -f1)
             local minor=$(echo "$SB_VER" | cut -d. -f2)
-            if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
-                USE_NEW_FORMAT=1
+            if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]]; then
+                if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
+                    USE_NEW_FORMAT=1
+                fi
             fi
         else
             USE_NEW_FORMAT=1
@@ -1549,7 +1556,7 @@ menu() {
         fi
         [ "$SB_STATUS" == "active" ] && ST_COLOR=$GREEN || ST_COLOR=$RED
         
-        VER=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        VER=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         if [ -n "$VER" ]; then
             if [ -n "$GLOBAL_LATEST_VER" ] && [ "$VER" != "$GLOBAL_LATEST_VER" ]; then VER_SHOW="${VER} ${YELLOW}[新版: ${GLOBAL_LATEST_VER}]${PLAIN}"
             else VER_SHOW="${VER}"
