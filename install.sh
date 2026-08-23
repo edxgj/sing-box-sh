@@ -321,7 +321,13 @@ init_base() {
             if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]]; then
                 if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
                     if grep -q '"domain_strategy"' $CONFIG_FILE; then
-                        jq '(.outbounds[] | select(has("domain_strategy"))) |= (.domain_resolver = {"strategy": .domain_strategy} | del(.domain_strategy))' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                        jq '
+                          if has("dns") | not then .dns = {"servers": [{"tag": "dns-local", "address": "local"}]}
+                          elif (.dns | has("servers") | not) then .dns.servers = [{"tag": "dns-local", "address": "local"}]
+                          elif (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then .dns.servers += [{"tag": "dns-local", "address": "local"}]
+                          else . end |
+                          (.outbounds[] | select(has("domain_strategy"))) |= (.domain_resolver = {"server": "dns-local", "strategy": .domain_strategy} | del(.domain_strategy))
+                        ' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
                     fi
                 fi
             fi
@@ -1452,7 +1458,13 @@ config_outbound() {
             1)
                 cp $CONFIG_FILE ${CONFIG_FILE}.bak
                 if [ "$USE_NEW_FORMAT" -eq 1 ]; then
-                    jq '(.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"strategy": "ipv4_only"})' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                    jq '
+                      if has("dns") | not then .dns = {"servers": [{"tag": "dns-local", "address": "local"}]}
+                      elif (.dns | has("servers") | not) then .dns.servers = [{"tag": "dns-local", "address": "local"}]
+                      elif (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then .dns.servers += [{"tag": "dns-local", "address": "local"}]
+                      else . end |
+                      (.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"server": "dns-local", "strategy": "ipv4_only"})
+                    ' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
                 else
                     jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv4_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
                 fi
@@ -1460,7 +1472,13 @@ config_outbound() {
             2)
                 cp $CONFIG_FILE ${CONFIG_FILE}.bak
                 if [ "$USE_NEW_FORMAT" -eq 1 ]; then
-                    jq '(.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"strategy": "ipv6_only"})' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                    jq '
+                      if has("dns") | not then .dns = {"servers": [{"tag": "dns-local", "address": "local"}]}
+                      elif (.dns | has("servers") | not) then .dns.servers = [{"tag": "dns-local", "address": "local"}]
+                      elif (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then .dns.servers += [{"tag": "dns-local", "address": "local"}]
+                      else . end |
+                      (.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"server": "dns-local", "strategy": "ipv6_only"})
+                    ' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
                 else
                     jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv6_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
                 fi
