@@ -157,7 +157,7 @@ open_fw_port() {
 
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then
         fw_found=1
-        ufw allow ${port}/${proto} >/dev/null 2>&1 && success=1
+        ufw allow ${port}/${proto} comment 'sb-sh' >/dev/null 2>&1 && success=1
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         fw_found=1
         firewall-cmd --add-port=${port}/${proto} --permanent >/dev/null 2>&1
@@ -483,7 +483,7 @@ generate_self_cert() {
 cert_manage() {
     while true; do
         clear
-        echo -e "选择: 证书管理中心\n"
+        echo -e "选择: 证书管理\n"
         echo -e " 1) 重新申请真实域名证书"
         echo -e " 2) 重新生成自签名证书"
         echo -e " 3) 查看证书与自动续期状态"
@@ -1001,7 +1001,7 @@ EOF
 modify_config() {
     while true; do
         clear
-        echo -e "选择: 更改节点配置\n"
+        echo -e "选择: 更改节点\n"
         select_inbound || return
 
         local TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' $CONFIG_FILE)
@@ -1178,7 +1178,7 @@ modify_config() {
 del_config() {
     while true; do
         clear
-        echo -e "选择: 删除节点配置\n"
+        echo -e "选择: 删除节点\n"
         select_inbound || return
         
         local TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' $CONFIG_FILE)
@@ -1270,7 +1270,7 @@ show_all_links() {
 view_config() {
     while true; do
         clear
-        echo -e "选择: 查看节点配置\n"
+        echo -e "选择: 查看节点\n"
         echo -e " 1) 单协议链接"
         echo -e " 2) 聚合链接"
         echo -e " 0) 返回\n"
@@ -1327,7 +1327,7 @@ update_manage() {
         fi
 
         clear
-        echo -e "选择: 检查更新\n"
+        echo -e "选择: 更新\n"
         echo -e " 1) ${SB_UPDATE_TEXT}"
         echo -e " 2) 更新脚本"
         echo -e " 0) 返回\n"
@@ -1377,6 +1377,94 @@ update_manage() {
     done
 }
 
+enable_bbr() {
+    echo -e "${CYAN}==> 尝试开启 BBR 加速...${PLAIN}"
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$current_cc" == "bbr" ]; then
+        echo -e "${GREEN}当前系统已经开启了 BBR，无需重复配置！${PLAIN}"
+        read -p "按回车键返回..."
+        return
+    fi
+
+    modprobe tcp_bbr 2>/dev/null
+
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null
+
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-bbr.conf << 'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
+
+    local new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$new_cc" == "bbr" ]; then
+        echo -e "${GREEN}BBR 加速开启成功！配置已写入 /etc/sysctl.d/99-bbr.conf，重启后依然生效。${PLAIN}"
+    else
+        echo -e "${YELLOW}应用失败，当前系统内核可能不支持 BBR，或架构受限（如 OpenVZ/LXC 容器）无法修改内核参数。${PLAIN}"
+    fi
+    read -p "按回车键返回..."
+}
+
+config_outbound() {
+    while true; do
+        clear
+        local current_strategy=$(jq -r '.outbounds[] | select(.tag=="direct") | .domain_strategy // "auto"' $CONFIG_FILE 2>/dev/null)
+        echo -e "选择: 配置出站 IPv4/IPv6 策略"
+        echo -e "当前出站策略: ${GREEN}${current_strategy}${PLAIN}\n"
+        echo -e " 1) 仅 IPv4 出站 (ipv4_only)"
+        echo -e " 2) 仅 IPv6 出站 (ipv6_only)"
+        echo -e " 3) 自动/双栈出站 (auto)"
+        echo -e " 0) 返回\n"
+        read -p "请选择 [0-3]: " out_idx
+        
+        case "$out_idx" in
+            1)
+                cp $CONFIG_FILE ${CONFIG_FILE}.bak
+                jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv4_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                ;;
+            2)
+                cp $CONFIG_FILE ${CONFIG_FILE}.bak
+                jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv6_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                ;;
+            3)
+                cp $CONFIG_FILE ${CONFIG_FILE}.bak
+                jq '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy)' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                ;;
+            0) return ;;
+            *) echo -e "${RED}输入错误!${PLAIN}"; sleep 1; continue ;;
+        esac
+        
+        if ! restart_service; then
+            echo -e "${RED}操作失败(校验报错)，配置已还原！${PLAIN}"
+            mv ${CONFIG_FILE}.bak $CONFIG_FILE
+        else
+            echo -e "${GREEN}出站策略已更新！${PLAIN}"
+            rm -f ${CONFIG_FILE}.bak
+        fi
+        read -p "按回车键继续..."
+    done
+}
+
+other_manage() {
+    while true; do
+        clear
+        echo -e "选择: 其他\n"
+        echo -e " 1) 开启 BBR 加速"
+        echo -e " 2) 配置出站 IPv4/IPv6"
+        echo -e " 0) 返回\n"
+        read -p "请选择 [0-2]: " om_idx
+        case "$om_idx" in
+            1) enable_bbr ;;
+            2) config_outbound ;;
+            0) return ;;
+            *) echo -e "${RED}输入错误!${PLAIN}"; sleep 1 ;;
+        esac
+    done
+}
+
 uninstall_all() {
     read -p "确认卸载脚本、sing-box和所有节点配置吗？(y/n): " un
     if [[ "$un" == "y" ]]; then
@@ -1406,6 +1494,13 @@ uninstall_all() {
         fi
         
         rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb /etc/sing-box
+        
+        if [ -f /etc/sysctl.d/99-bbr.conf ]; then
+            rm -f /etc/sysctl.d/99-bbr.conf 2>/dev/null
+            sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+            sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1
+        fi
+        
         echo -e "${GREEN}已彻底卸载！系统已恢复原状。${PLAIN}"
     fi
 }
@@ -1443,9 +1538,10 @@ menu() {
         echo -e " 5) 证书管理"
         echo -e " 6) 运行管理"
         echo -e " 7) 更新"
-        echo -e " 8) 卸载"
+        echo -e " 8) 其他"
+        echo -e " 9) 卸载"
         echo -e " 0) 退出\n"
-        read -p "请选择 [0-8]: " choice
+        read -p "请选择 [0-9]: " choice
 
         case "$choice" in
             1) add_config ;;
@@ -1455,7 +1551,8 @@ menu() {
             5) cert_manage ;;
             6) run_manage ;;
             7) update_manage ;;
-            8) uninstall_all; exit 0 ;;
+            8) other_manage ;;
+            9) uninstall_all; exit 0 ;;
             0) exit 0 ;;
             *) echo "输入错误!"; sleep 1 ;;
         esac
