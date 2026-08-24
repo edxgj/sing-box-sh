@@ -149,6 +149,18 @@ load_secrets() {
     [ -f "$SECRETS_FILE" ] && source "$SECRETS_FILE"
 }
 
+apply_jq_config() {
+    local jq_filter="$1"
+    shift
+    if jq "$@" "$jq_filter" "$CONFIG_FILE" > "$TMP_JSON" && [ -s "$TMP_JSON" ]; then
+        mv "$TMP_JSON" "$CONFIG_FILE"
+        return 0
+    else
+        echo -e "${RED}配置生成失败，请检查 jq 表达式或联系维护者！${PLAIN}" >&2
+        return 1
+    fi
+}
+
 open_fw_port() {
     local port=$1
     local proto=$2
@@ -236,14 +248,12 @@ migrate_certs() {
         if [ "$CERT_TYPE" == "real" ]; then
             mv "$CERT_DIR/fullchain.cer" "$CERT_DIR/real.cer" 2>/dev/null
             mv "$CERT_DIR/private.key" "$CERT_DIR/real.key" 2>/dev/null
-            sed -i 's|fullchain.cer|real.cer|g' $CONFIG_FILE
-            sed -i 's|private.key|real.key|g' $CONFIG_FILE
+            apply_jq_config '(.inbounds[] | select(has("tls")) | .tls.certificate_path) |= sub("fullchain.cer"; "real.cer") | (.inbounds[] | select(has("tls")) | .tls.key_path) |= sub("private.key"; "real.key")' >/dev/null 2>&1
             save_secret "REAL_DOMAIN" "$DOMAIN"
         else
             mv "$CERT_DIR/fullchain.cer" "$CERT_DIR/self.cer" 2>/dev/null
             mv "$CERT_DIR/private.key" "$CERT_DIR/self.key" 2>/dev/null
-            sed -i 's|fullchain.cer|self.cer|g' $CONFIG_FILE
-            sed -i 's|private.key|self.key|g' $CONFIG_FILE
+            apply_jq_config '(.inbounds[] | select(has("tls")) | .tls.certificate_path) |= sub("fullchain.cer"; "self.cer") | (.inbounds[] | select(has("tls")) | .tls.key_path) |= sub("private.key"; "self.key")' >/dev/null 2>&1
             save_secret "SELF_DOMAIN" "$DOMAIN"
         fi
         sed -i '/CERT_TYPE=/d' "$SECRETS_FILE"
@@ -311,8 +321,7 @@ init_base() {
     if [ ! -f "$CONFIG_FILE" ]; then
         echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > $CONFIG_FILE
     else
-        sed -i 's/"geoip":"private"/"ip_is_private":true/g' $CONFIG_FILE
-        sed -i 's/"geoip": "private"/"ip_is_private": true/g' $CONFIG_FILE
+        apply_jq_config '(.route.rules[] | select(has("geoip") and .geoip == "private")) |= (del(.geoip) | .ip_is_private = true)' >/dev/null 2>&1
         
         local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         if [ -n "$SB_VER" ]; then
@@ -321,14 +330,14 @@ init_base() {
             if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]]; then
                 if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
                     if grep -q '"domain_strategy"' $CONFIG_FILE || grep -q '"domain_resolver"' $CONFIG_FILE; then
-                        jq '
+                        apply_jq_config '
                           .dns.servers |= (. // []) |
                           if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
                             .dns.servers += [{"tag": "dns-local", "type": "local"}]
                           else . end |
                           (.outbounds[] | select(has("domain_strategy"))) |= (.domain_resolver = {"server": "dns-local", "strategy": .domain_strategy} | del(.domain_strategy)) |
                           (.outbounds[] | select(has("domain_resolver"))) |= (if .domain_resolver.server == null or .domain_resolver.server == "" then .domain_resolver.server = "dns-local" else . end)
-                        ' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                        ' >/dev/null 2>&1
                     fi
                 fi
             fi
@@ -879,6 +888,7 @@ add_config() {
     
     cp $CONFIG_FILE ${CONFIG_FILE}.bak
     local IS_ARGO=0
+    local jq_ok=1
 
     case "$proto_idx" in
         1)
@@ -890,27 +900,30 @@ add_config() {
             local SID=$(/usr/local/bin/sing-box generate rand --hex 8)
             save_secret "REALITY_PUB_${PORT}" "$PUB"
             
-            jq --argjson p "$PORT" --arg uuid "$UUID" --arg sni "$SNI" --arg pk "$PK" --arg sid "$SID" --arg tag "$TAG" \
-            '.inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sni,"reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            apply_jq_config '.inbounds += [{"type":"vless","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sni,"reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}]' \
+            --argjson p "$PORT" --arg uuid "$UUID" --arg sni "$SNI" --arg pk "$PK" --arg sid "$SID" --arg tag "$TAG" || jq_ok=0
             ;;
         2)
             local PASS=$(get_pass)
             if ! prompt_cert_type; then rm -f ${CONFIG_FILE}.bak; return; fi
-            jq --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" \
-            '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            
+            apply_jq_config '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' \
+            --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
             ;;
         3)
             local UUID=$(get_uuid)
             local PASS=$(get_pass)
             if ! prompt_cert_type; then rm -f ${CONFIG_FILE}.bak; return; fi
-            jq --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" \
-            '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            
+            apply_jq_config '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' \
+            --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
             ;;
         4)
             local PASS=$(get_pass)
             if ! prompt_cert_type; then rm -f ${CONFIG_FILE}.bak; return; fi
-            jq --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" \
-            '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h2","http/1.1"],"certificate_path":$cert,"key_path":$key}}]' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            
+            apply_jq_config '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h2","http/1.1"],"certificate_path":$cert,"key_path":$key}}]' \
+            --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
             ;;
         5)
             IS_ARGO=1
@@ -928,25 +941,26 @@ add_config() {
             save_secret "ARGO_IP_${PORT}" "$ARGO_IP"
             save_secret "ARGO_DOMAIN_${PORT}" "$ARGO_DOMAIN"
             
-            jq --argjson p "$PORT" --arg uuid "$UUID" --arg tag "$TAG" \
-            '.inbounds += [{"type":"vless","tag":$tag,"listen":"127.0.0.1","listen_port":$p,"users":[{"uuid":$uuid}],"transport":{"type":"ws","path":"/argo"}}]' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
-            
-            if ! command -v cloudflared &> /dev/null; then
-                echo -e "${CYAN}正在下载 cloudflared 组件...${PLAIN}"
-                local TMP_CF=$(mktemp)
-                local cf_arch="amd64"
-                [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && cf_arch="arm64"
-                if wget --show-progress -qO $TMP_CF "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" || curl -sL -o $TMP_CF "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"; then
-                    mv $TMP_CF /usr/local/bin/cloudflared
-                    chmod +x /usr/local/bin/cloudflared
-                else
-                    echo -e "${RED}下载 cloudflared 失败！${PLAIN}"
-                    rm -f $TMP_CF
+            if ! apply_jq_config '.inbounds += [{"type":"vless","tag":$tag,"listen":"127.0.0.1","listen_port":$p,"users":[{"uuid":$uuid}],"transport":{"type":"ws","path":"/argo"}}]' \
+            --argjson p "$PORT" --arg uuid "$UUID" --arg tag "$TAG"; then
+                jq_ok=0
+            else
+                if ! command -v cloudflared &> /dev/null; then
+                    echo -e "${CYAN}正在下载 cloudflared 组件...${PLAIN}"
+                    local TMP_CF=$(mktemp)
+                    local cf_arch="amd64"
+                    [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && cf_arch="arm64"
+                    if wget --show-progress -qO $TMP_CF "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" || curl -sL -o $TMP_CF "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"; then
+                        mv $TMP_CF /usr/local/bin/cloudflared
+                        chmod +x /usr/local/bin/cloudflared
+                    else
+                        echo -e "${RED}下载 cloudflared 失败！${PLAIN}"
+                        rm -f $TMP_CF
+                    fi
                 fi
-            fi
-            
-            if [ "$OS_TYPE" == "alpine" ]; then
-                cat > "/etc/init.d/cloudflared-${TAG}" << 'EOF'
+                
+                if [ "$OS_TYPE" == "alpine" ]; then
+                    cat > "/etc/init.d/cloudflared-${TAG}" << 'EOF'
 #!/sbin/openrc-run
 name="cloudflared-@@SB_TAG@@"
 command="/usr/local/bin/cloudflared"
@@ -955,13 +969,13 @@ command_background=true
 pidfile="/var/run/cloudflared-@@SB_TAG@@.pid"
 depend() { need net; }
 EOF
-                sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/init.d/cloudflared-${TAG}"
-                sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/init.d/cloudflared-${TAG}"
-                chmod +x "/etc/init.d/cloudflared-${TAG}"
-                rc-update add "cloudflared-${TAG}" default >/dev/null 2>&1
-                rc-service "cloudflared-${TAG}" restart >/dev/null 2>&1
-            else
-                cat > "/etc/systemd/system/cloudflared-${TAG}.service" << 'EOF'
+                    sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/init.d/cloudflared-${TAG}"
+                    sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/init.d/cloudflared-${TAG}"
+                    chmod +x "/etc/init.d/cloudflared-${TAG}"
+                    rc-update add "cloudflared-${TAG}" default >/dev/null 2>&1
+                    rc-service "cloudflared-${TAG}" restart >/dev/null 2>&1
+                else
+                    cat > "/etc/systemd/system/cloudflared-${TAG}.service" << 'EOF'
 [Unit]
 Description=cloudflared tunnel for @@SB_TAG@@
 After=network.target
@@ -972,14 +986,24 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
-                sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/systemd/system/cloudflared-${TAG}.service"
-                sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/systemd/system/cloudflared-${TAG}.service"
-                systemctl daemon-reload >/dev/null 2>&1
-                systemctl enable "cloudflared-${TAG}" --now >/dev/null 2>&1
+                    sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/systemd/system/cloudflared-${TAG}.service"
+                    sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/systemd/system/cloudflared-${TAG}.service"
+                    systemctl daemon-reload >/dev/null 2>&1
+                    systemctl enable "cloudflared-${TAG}" --now >/dev/null 2>&1
+                fi
             fi
             ;;
     esac
     
+    if [ "$jq_ok" -eq 0 ]; then
+        mv ${CONFIG_FILE}.bak $CONFIG_FILE
+        remove_secret "REALITY_PUB_${PORT}"
+        remove_secret "ARGO_IP_${PORT}"
+        remove_secret "ARGO_DOMAIN_${PORT}"
+        read -p "按回车键返回上一级..."
+        return
+    fi
+
     if ! restart_service; then
         echo -e "${RED}节点添加失败(校验报错)，已为您还原配置！${PLAIN}"
         mv ${CONFIG_FILE}.bak $CONFIG_FILE
@@ -1066,9 +1090,17 @@ modify_config() {
             if [ "$action" == "uuid" ]; then NEW_AUTH=$(get_uuid); else NEW_AUTH=$(get_pass); fi
             
             if [ "$action" == "uuid" ]; then
-                jq --arg tag "$TAG" --arg auth "$NEW_AUTH" '(.inbounds[] | select(.tag==$tag) | .users[0].uuid) = $auth' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .users[0].uuid) = $auth' --arg tag "$TAG" --arg auth "$NEW_AUTH"; then
+                    rm -f ${CONFIG_FILE}.bak
+                    read -p "按回车键返回上一级..."
+                    continue
+                fi
             else
-                jq --arg tag "$TAG" --arg auth "$NEW_AUTH" '(.inbounds[] | select(.tag==$tag) | .users[0].password) = $auth' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .users[0].password) = $auth' --arg tag "$TAG" --arg auth "$NEW_AUTH"; then
+                    rm -f ${CONFIG_FILE}.bak
+                    read -p "按回车键返回上一级..."
+                    continue
+                fi
             fi
             
             if ! restart_service; then 
@@ -1080,9 +1112,12 @@ modify_config() {
             
         elif [ "$action" == "cert" ]; then
             if prompt_cert_type; then
-                jq --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" \
-                '(.inbounds[] | select(.tag==$tag) | .tls.certificate_path) = $cert | (.inbounds[] | select(.tag==$tag) | .tls.key_path) = $key' \
-                $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tls.certificate_path) = $cert | (.inbounds[] | select(.tag==$tag) | .tls.key_path) = $key' \
+                --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY"; then
+                    rm -f ${CONFIG_FILE}.bak
+                    read -p "按回车键返回上一级..."
+                    continue
+                fi
                 
                 if ! restart_service; then 
                     echo -e "${RED}操作失败，已还原配置！${PLAIN}"; mv ${CONFIG_FILE}.bak $CONFIG_FILE
@@ -1111,7 +1146,11 @@ modify_config() {
                 break
             done
             
-            jq --arg tag "$TAG" --argjson p "$NEW_PORT" '(.inbounds[] | select(.tag==$tag) | .listen_port) = $p' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .listen_port) = $p' --arg tag "$TAG" --argjson p "$NEW_PORT"; then
+                rm -f ${CONFIG_FILE}.bak
+                read -p "按回车键返回上一级..."
+                continue
+            fi
             
             load_secrets
             if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1; then
@@ -1169,7 +1208,11 @@ modify_config() {
             local IS_ARGO=0
             if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then IS_ARGO=1; fi
             
-            jq --arg tag "$TAG" --arg newtag "$NEW_TAG" '(.inbounds[] | select(.tag==$tag) | .tag) = $newtag' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tag) = $newtag' --arg tag "$TAG" --arg newtag "$NEW_TAG"; then
+                rm -f ${CONFIG_FILE}.bak
+                read -p "按回车键返回上一级..."
+                continue
+            fi
             
             if ! restart_service; then 
                 echo -e "${RED}操作失败，已还原配置！${PLAIN}"
@@ -1201,9 +1244,12 @@ modify_config() {
         elif [ "$action" == "sni" ]; then
             local NEW_SNI=$(get_domain "请输入新的伪装域名" "apple.com")
             
-            jq --arg tag "$TAG" --arg sni "$NEW_SNI" \
-            '(.inbounds[] | select(.tag==$tag) | .tls.server_name) = $sni | (.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server) = $sni' \
-            $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+            if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tls.server_name) = $sni | (.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server) = $sni' \
+            --arg tag "$TAG" --arg sni "$NEW_SNI"; then
+                rm -f ${CONFIG_FILE}.bak
+                read -p "按回车键返回上一级..."
+                continue
+            fi
             
             if ! restart_service; then 
                 echo -e "${RED}操作失败，已还原配置！${PLAIN}"
@@ -1227,7 +1273,12 @@ del_config() {
         local PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port' $CONFIG_FILE)
 
         cp $CONFIG_FILE ${CONFIG_FILE}.bak
-        jq --arg tag "$TAG" 'del(.inbounds[] | select(.tag == $tag))' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+        
+        if ! apply_jq_config 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$TAG"; then
+            rm -f ${CONFIG_FILE}.bak
+            read -p "按回车键返回上一级..."
+            continue
+        fi
         
         if ! restart_service; then
             echo -e "${RED}删除失败：配置还原，内核未能正常重启！${PLAIN}"
@@ -1479,42 +1530,59 @@ config_outbound() {
             USE_NEW_FORMAT=1
         fi
         
+        local jq_success=0
         case "$out_idx" in
             1)
                 cp $CONFIG_FILE ${CONFIG_FILE}.bak
                 if [ "$USE_NEW_FORMAT" -eq 1 ]; then
-                    jq '
+                    if apply_jq_config '
                       .dns.servers |= (. // []) |
-                      if (. | map(select(.tag == "dns-local")) | length == 0) then
-                        . += [{"tag": "dns-local", "type": "local"}]
+                      if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
+                        .dns.servers += [{"tag": "dns-local", "type": "local"}]
                       else . end |
                       (.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"server": "dns-local", "strategy": "ipv4_only"})
-                    ' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                    '; then
+                        jq_success=1
+                    fi
                 else
-                    jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv4_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                    if apply_jq_config '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv4_only"'; then
+                        jq_success=1
+                    fi
                 fi
                 ;;
             2)
                 cp $CONFIG_FILE ${CONFIG_FILE}.bak
                 if [ "$USE_NEW_FORMAT" -eq 1 ]; then
-                    jq '
+                    if apply_jq_config '
                       .dns.servers |= (. // []) |
-                      if (. | map(select(.tag == "dns-local")) | length == 0) then
-                        . += [{"tag": "dns-local", "type": "local"}]
+                      if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
+                        .dns.servers += [{"tag": "dns-local", "type": "local"}]
                       else . end |
                       (.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"server": "dns-local", "strategy": "ipv6_only"})
-                    ' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                    '; then
+                        jq_success=1
+                    fi
                 else
-                    jq '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv6_only"' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                    if apply_jq_config '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv6_only"'; then
+                        jq_success=1
+                    fi
                 fi
                 ;;
             3)
                 cp $CONFIG_FILE ${CONFIG_FILE}.bak
-                jq '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver)' $CONFIG_FILE > $TMP_JSON && [ -s $TMP_JSON ] && mv $TMP_JSON $CONFIG_FILE
+                if apply_jq_config '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver)'; then
+                    jq_success=1
+                fi
                 ;;
             0) return ;;
             *) echo -e "${RED}输入错误!${PLAIN}"; sleep 1; continue ;;
         esac
+
+        if [ "$jq_success" -eq 0 ]; then
+            rm -f ${CONFIG_FILE}.bak
+            read -p "按回车键继续..."
+            continue
+        fi
         
         if ! restart_service; then
             echo -e "${RED}操作失败(校验报错)，配置已还原！${PLAIN}"
