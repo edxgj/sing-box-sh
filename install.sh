@@ -1,5 +1,7 @@
 #!/bin/bash
 
+umask 077
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -12,9 +14,8 @@ CERT_DIR="$CONFIG_DIR/cert"
 SECRETS_FILE="$CONFIG_DIR/.secrets"
 FW_PORTS_FILE="$CONFIG_DIR/.fw_ports"
 
-TMP_JSON=$(mktemp)
-trap 'rm -f $TMP_JSON' EXIT
-trap 'rm -f $TMP_JSON; exit 1' INT TERM
+trap 'rm -f "${CONFIG_FILE}".tmp.* /usr/local/bin/.sb.* 2>/dev/null' EXIT
+trap 'rm -f "${CONFIG_FILE}".tmp.* /usr/local/bin/.sb.* 2>/dev/null; exit 1' INT TERM
 
 if [ -f /etc/alpine-release ]; then
     OS_TYPE="alpine"
@@ -93,6 +94,22 @@ get_latest_version() {
     echo "$GLOBAL_LATEST_VER"
 }
 
+JQ_DNS_LOCAL='.dns.servers |= (. // []) |
+  if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
+    .dns.servers += [{"tag": "dns-local", "type": "local"}]
+  else . end'
+
+sb_ge_112() {
+    local ver=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    [ -z "$ver" ] && return 1
+    local major=$(echo "$ver" | cut -d. -f1)
+    local minor=$(echo "$ver" | cut -d. -f2)
+    [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]] || return 1
+    [ "$major" -gt 1 ] && return 0
+    { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; } && return 0
+    return 1
+}
+
 check_port() {
     local port=$1
     local proto=${2:-both}
@@ -100,10 +117,11 @@ check_port() {
     [ "$proto" == "tcp" ] && ss_arg="-tln"
     [ "$proto" == "udp" ] && ss_arg="-uln"
     
+    local pat="[^[:space:]]:${port}([[:space:]]|\$)"
     if command -v ss >/dev/null 2>&1; then
-        ss $ss_arg | awk '{print $4}' | grep -qE ":${port}$"
+        ss $ss_arg 2>/dev/null | tail -n +2 | grep -qE "$pat"
     elif command -v netstat >/dev/null 2>&1; then
-        netstat $ss_arg | awk '{print $4}' | grep -qE ":${port}$"
+        netstat $ss_arg 2>/dev/null | grep -qE "$pat"
     else
         return 1
     fi
@@ -112,7 +130,7 @@ check_port() {
 rand_port() {
     local port
     while true; do
-        port=$(shuf -i 10000-65000 -n 1)
+        port=$(( ( (RANDOM << 15) | RANDOM ) % 55001 + 10000 ))
         if ! check_port "$port"; then
             echo "$port"
             break
@@ -140,31 +158,47 @@ save_secret() {
     touch "$SECRETS_FILE"
     grep -v "^${key}=" "$SECRETS_FILE" > "${SECRETS_FILE}.tmp"
     echo "${key}='${val}'" >> "${SECRETS_FILE}.tmp"
-    mv "${SECRETS_FILE}.tmp" "$SECRETS_FILE"
+    mv -f "${SECRETS_FILE}.tmp" "$SECRETS_FILE"
 }
 
 remove_secret() {
     local key_prefix=$1
     if [ -f "$SECRETS_FILE" ]; then
         grep -v "^${key_prefix}=" "$SECRETS_FILE" > "${SECRETS_FILE}.tmp"
-        mv "${SECRETS_FILE}.tmp" "$SECRETS_FILE"
+        mv -f "${SECRETS_FILE}.tmp" "$SECRETS_FILE"
     fi
 }
 
 load_secrets() {
     [ -f "$SECRETS_FILE" ] && source "$SECRETS_FILE"
+    return 0
 }
 
 apply_jq_config() {
     local jq_filter="$1"
     shift
-    if jq "$@" "$jq_filter" "$CONFIG_FILE" > "$TMP_JSON" && [ -s "$TMP_JSON" ]; then
-        mv "$TMP_JSON" "$CONFIG_FILE"
+    local tmp
+    tmp=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX") || return 1
+    if jq "$@" "$jq_filter" "$CONFIG_FILE" > "$tmp" && [ -s "$tmp" ]; then
+        mv -f "$tmp" "$CONFIG_FILE"
         return 0
     else
+        rm -f "$tmp"
         echo -e "${RED}配置生成失败，请检查 jq 表达式或联系维护者！${PLAIN}" >&2
         return 1
     fi
+}
+
+fetch_script() {
+    local t=$(mktemp /usr/local/bin/.sb.XXXXXX) || return 1
+    if curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o "$t" \
+       && [ -s "$t" ] && head -n 1 "$t" | grep -q '^#!/bin/bash'; then
+        chmod 755 "$t"
+        mv -f "$t" /usr/local/bin/sb
+        return 0
+    fi
+    rm -f "$t"
+    return 1
 }
 
 open_fw_port() {
@@ -175,7 +209,8 @@ open_fw_port() {
 
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then
         fw_found=1
-        ufw allow ${port}/${proto} comment 'sb-sh' >/dev/null 2>&1 && success=1
+        ufw allow ${port}/${proto} comment 'sb-sh' >/dev/null 2>&1 || ufw allow ${port}/${proto} >/dev/null 2>&1
+        [ $? -eq 0 ] && success=1
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         fw_found=1
         firewall-cmd --add-port=${port}/${proto} --permanent >/dev/null 2>&1
@@ -262,8 +297,7 @@ migrate_certs() {
             apply_jq_config '(.inbounds[] | select(.tls.certificate_path? != null) | .tls.certificate_path) |= sub("fullchain.cer"; "self.cer") | (.inbounds[] | select(.tls.key_path? != null) | .tls.key_path) |= sub("private.key"; "self.key")' >/dev/null 2>&1
             save_secret "SELF_DOMAIN" "$DOMAIN"
         fi
-        sed -i '/CERT_TYPE=/d' "$SECRETS_FILE"
-        sed -i '/DOMAIN=/d' "$SECRETS_FILE"
+        sed -i '/^CERT_TYPE=/d; /^DOMAIN=/d' "$SECRETS_FILE"
     fi
 }
 
@@ -292,7 +326,7 @@ init_base() {
         fi
         
         echo -e "${CYAN}==> 正在获取最新版 sing-box 内核信息...${PLAIN}"
-        VERSION=$(get_latest_version)
+        local VERSION=$(get_latest_version)
         
         if [ -z "$VERSION" ]; then
             echo -e "${YELLOW}获取版本信息失败！${PLAIN}"
@@ -324,28 +358,45 @@ init_base() {
 
     mkdir -p $CONFIG_DIR $CERT_DIR || return 1
     
+    if [ -f "$CONFIG_FILE" ]; then
+        if ! jq -e '.inbounds | type == "array"' "$CONFIG_FILE" >/dev/null 2>&1; then
+            echo -e "${RED}检测到 $CONFIG_FILE 已损坏（非法 JSON 或缺少 inbounds 数组）！${PLAIN}"
+            read -p "是否重建为空白配置？原文件会被备份，但现有节点将丢失。(y/n) [默认: n]: " rebuild
+            if [[ "${rebuild:-n}" != "y" && "${rebuild:-n}" != "Y" ]]; then
+                echo -e "${YELLOW}已取消，未做任何修改。请手动修复该文件后再运行本脚本。${PLAIN}"
+                return 1
+            fi
+            local broken_bak="${CONFIG_FILE}.broken.$(date +%Y%m%d%H%M%S)"
+            if mv "$CONFIG_FILE" "$broken_bak" 2>/dev/null; then
+                echo -e "${YELLOW}原文件已备份为: ${broken_bak}${PLAIN}"
+            fi
+        fi
+    fi
+    
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > $CONFIG_FILE
+        if sb_ge_112; then
+            echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[{"ip_is_private":true,"action":"reject"}]}}' > $CONFIG_FILE
+        else
+            echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > $CONFIG_FILE
+        fi
     else
         apply_jq_config '(.route.rules[] | select(has("geoip") and .geoip == "private")) |= (del(.geoip) | .ip_is_private = true)' >/dev/null 2>&1
         
-        local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-        if [ -n "$SB_VER" ]; then
-            local major=$(echo "$SB_VER" | cut -d. -f1)
-            local minor=$(echo "$SB_VER" | cut -d. -f2)
-            if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]]; then
-                if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
-                    if grep -q '"domain_strategy"' $CONFIG_FILE || grep -q '"domain_resolver"' $CONFIG_FILE; then
-                        apply_jq_config '
-                          .dns.servers |= (. // []) |
-                          if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
-                            .dns.servers += [{"tag": "dns-local", "type": "local"}]
-                          else . end |
-                          (.outbounds[] | select(has("domain_strategy"))) |= (.domain_resolver = {"server": "dns-local", "strategy": .domain_strategy} | del(.domain_strategy)) |
-                          (.outbounds[] | select(has("domain_resolver"))) |= (if .domain_resolver.server == null or .domain_resolver.server == "" then .domain_resolver.server = "dns-local" else . end)
-                        ' >/dev/null 2>&1
-                    fi
-                fi
+        if ! jq -e '.outbounds? // [] | map(select(.tag=="direct")) | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+            apply_jq_config '.outbounds = ((.outbounds // []) + [{"type":"direct","tag":"direct"}])' >/dev/null 2>&1
+        fi
+        
+        if sb_ge_112; then
+            if grep -q '"block"' $CONFIG_FILE; then
+                apply_jq_config '(.route.rules[]? | select(.outbound=="block")) |= (del(.outbound) | .action="reject") | .outbounds |= map(select(.type!="block"))' >/dev/null 2>&1
+            fi
+            
+            if grep -q '"domain_strategy"' $CONFIG_FILE || grep -q '"domain_resolver"' $CONFIG_FILE; then
+                apply_jq_config "
+                  $JQ_DNS_LOCAL |
+                  (.outbounds[] | select(has(\"domain_strategy\"))) |= (.domain_resolver = {\"server\": \"dns-local\", \"strategy\": .domain_strategy} | del(.domain_strategy)) |
+                  (.outbounds[] | select(has(\"domain_resolver\"))) |= (if .domain_resolver.server == null or .domain_resolver.server == \"\" then .domain_resolver.server = \"dns-local\" else . end)
+                " >/dev/null 2>&1
             fi
         fi
     fi
@@ -375,7 +426,7 @@ EOF
         chmod +x /etc/init.d/sing-box
         rc-update add sing-box default >/dev/null 2>&1
         rc-service sing-box restart >/dev/null 2>&1
-        sleep 1
+        sleep 2
         if ! rc-service sing-box status 2>/dev/null | grep -q 'started'; then return 1; fi
     else
         cat > /etc/systemd/system/sing-box.service << 'EOF'
@@ -393,8 +444,11 @@ EOF
         systemctl daemon-reload
         systemctl enable sing-box --now >/dev/null 2>&1
         systemctl restart sing-box >/dev/null 2>&1
-        sleep 1
-        if [ "$(systemctl is-active sing-box 2>/dev/null)" != "active" ]; then return 1; fi
+        sleep 2
+        if [ "$(systemctl is-active sing-box 2>/dev/null)" != "active" ]; then
+            sleep 2
+            [ "$(systemctl is-active sing-box 2>/dev/null)" != "active" ] && return 1
+        fi
     fi
     return 0
 }
@@ -425,9 +479,38 @@ get_domain() {
 
 apply_real_cert() {
     local NEW_DOMAIN=$(get_domain "请输入解析到本机的域名" "")
-    save_secret "REAL_DOMAIN" "$NEW_DOMAIN"
+
+    local reuse=0
+    local had_prior=0
+    if [ -f ~/.acme.sh/acme.sh ]; then
+        local dconf=$(~/.acme.sh/acme.sh --info -d "${NEW_DOMAIN}" 2>/dev/null | sed -n 's/^DOMAIN_CONF=//p')
+        local exist_cer=""
+        if [ -n "$dconf" ]; then
+            local ddir="${dconf%/*}"
+            for c in "$ddir/fullchain.cer" "$ddir/${NEW_DOMAIN}.cer"; do
+                [ -s "$c" ] && { exist_cer="$c"; break; }
+            done
+        fi
+        # 该域名在 acme.sh 里已有记录，说明证书不是本脚本创建的，卸载时不得删除
+        [ -n "$exist_cer" ] && had_prior=1
+        if [ -n "$exist_cer" ]; then
+            local left_days=""
+            if command -v openssl >/dev/null 2>&1; then
+                local end_ts=$(date -d "$(openssl x509 -in "$exist_cer" -noout -enddate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null)
+                [ -n "$end_ts" ] && left_days=$(( (end_ts - $(date +%s)) / 86400 ))
+            fi
+            if [ -n "$left_days" ] && [ "$left_days" -gt 7 ]; then
+                echo -e "\n${GREEN}检测到 ${NEW_DOMAIN} 已有有效证书，剩余 ${left_days} 天。${PLAIN}"
+                echo -e "${YELLOW}Let's Encrypt 对同一域名限制 168 小时内最多签发 5 次，建议直接复用。${PLAIN}"
+                read -p "是否复用现有证书？(y/n) [默认: y]: " ru
+                [[ "${ru:-y}" == "y" || "${ru:-y}" == "Y" ]] && reuse=1
+            fi
+        fi
+    fi
+
+    if [ "$reuse" -eq 0 ]; then
     echo -e "\n请选择验证方式:"
-    echo -e " 1) 80端口独立申请 (Standalone) - 需确保服务器80端口开放且未被占用"
+    echo -e " 1) 80端口独立申请 - 需确保服务器80端口开放且未被占用"
     echo -e " 2) Cloudflare DNS API - 推荐，适合各类环境"
     local v_mode
     while true; do
@@ -442,7 +525,13 @@ apply_real_cert() {
 
     if [ "$v_mode" == "1" ]; then
         open_fw_port 80 tcp >/dev/null
+        local issue_ok=1
         if ! ~/.acme.sh/acme.sh --issue -d ${NEW_DOMAIN} --standalone --force; then
+            issue_ok=0
+        fi
+        close_fw_port 80 tcp
+        sed -i "\\|^80/tcp\$|d" "$FW_PORTS_FILE" 2>/dev/null
+        if [ "$issue_ok" -eq 0 ]; then
             echo -e "${RED}申请失败！请检查域名解析和 80 端口是否连通。${PLAIN}"
             return 1
         fi
@@ -462,27 +551,37 @@ apply_real_cert() {
         done
         
         if ! CF_Key="${NEW_CF_Key}" CF_Email="${NEW_CF_Email}" ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${NEW_DOMAIN} --force; then
-            echo -e "${RED}申请失败！请检查 CF API 是否正确。${PLAIN}"
+            echo -e "${RED}申请失败！请检查 CF API 是否正确，或该域名已达 Let's Encrypt 签发频率上限。${PLAIN}"
             return 1
         fi
     fi
-    
-    if [ "$OS_TYPE" == "alpine" ]; then
-        RELOAD_CMD="rc-service sing-box restart"
-    else
-        RELOAD_CMD="systemctl restart sing-box"
     fi
     
-    if ! ~/.acme.sh/acme.sh --installcert -d ${NEW_DOMAIN} \
+    if [ "$OS_TYPE" == "alpine" ]; then
+        local RELOAD_CMD="rc-service sing-box restart >/dev/null 2>&1 || true"
+    else
+        local RELOAD_CMD="systemctl restart sing-box >/dev/null 2>&1 || true"
+    fi
+    
+    ~/.acme.sh/acme.sh --installcert -d ${NEW_DOMAIN} \
         --fullchainpath $CERT_DIR/real.cer \
         --keypath $CERT_DIR/real.key \
-        --reloadcmd "$RELOAD_CMD"; then
+        --reloadcmd "$RELOAD_CMD"
+    
+    if [ ! -s "$CERT_DIR/real.cer" ] || [ ! -s "$CERT_DIR/real.key" ]; then
         echo -e "${RED}证书部署至目标目录失败！请检查系统权限或 acme.sh 报错信息。${PLAIN}"
         return 1
     fi
     
     chmod 644 $CERT_DIR/*.cer 2>/dev/null
     chmod 600 $CERT_DIR/*.key 2>/dev/null
+    save_secret "REAL_DOMAIN" "$NEW_DOMAIN"
+    # 记录该证书是否为脚本自己申请：复用/已有记录的证书属于用户，卸载时不得 acme --remove
+    if [ "$had_prior" -eq 1 ]; then
+        save_secret "REAL_CERT_OWNED" "0"
+    else
+        save_secret "REAL_CERT_OWNED" "1"
+    fi
     echo -e "${GREEN}域名证书申请并安装完成！${PLAIN}"
     return 0
 }
@@ -498,7 +597,6 @@ generate_self_cert() {
     fi
 
     local NEW_DOMAIN=$(get_domain "请输入伪装域名" "bing.com")
-    save_secret "SELF_DOMAIN" "$NEW_DOMAIN"
     
     echo -e "${CYAN}正在生成自签证书...${PLAIN}"
     if ! ( umask 077; openssl req -x509 -nodes -days 36500 -newkey rsa:2048 \
@@ -507,6 +605,7 @@ generate_self_cert() {
         rm -f $CERT_DIR/self.key $CERT_DIR/self.cer
         return 1
     fi
+    save_secret "SELF_DOMAIN" "$NEW_DOMAIN"
     
     chmod 644 $CERT_DIR/*.cer 2>/dev/null
     chmod 600 $CERT_DIR/*.key 2>/dev/null
@@ -616,7 +715,6 @@ get_pass() {
     echo -e "密码: ${GREEN}${val}${PLAIN}" >&2
     echo "$val"
 }
-
 get_unique_tag() {
     local base_tag=$1
     local counter=2
@@ -628,69 +726,90 @@ get_unique_tag() {
     echo "$final_tag"
 }
 
+node_read() {
+    jq -r --arg tag "$1" '
+      .inbounds[] | select(.tag==$tag) |
+      .type,
+      (.listen_port|tostring),
+      (.tls.certificate_path // ""),
+      (.users[0].uuid // ""),
+      (.users[0].password // ""),
+      (.tls.server_name // ""),
+      (.tls.reality.short_id[0] // ""),
+      (if .tls.reality.enabled == true then "1" else "0" end),
+      (if .transport.type == "ws" then "1" else "0" end)
+    ' "$CONFIG_FILE" 2>/dev/null
+}
+
+resolve_conn() {
+    local cert_path=$1
+    local ip=$2
+    CONN_ADDR=$ip
+    CONN_INSECURE=1
+    CONN_SNI=""
+    if [[ "$cert_path" == *"/real.cer" ]]; then
+        if [ -z "$REAL_DOMAIN" ] && [ -s "$cert_path" ] && command -v openssl >/dev/null 2>&1; then
+            REAL_DOMAIN=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p' | tr -d ' ')
+            [ -n "$REAL_DOMAIN" ] && save_secret "REAL_DOMAIN" "$REAL_DOMAIN"
+        fi
+        CONN_ADDR=$REAL_DOMAIN
+        CONN_INSECURE=0
+        CONN_SNI=$REAL_DOMAIN
+    elif [[ "$cert_path" == *"/self.cer" ]]; then
+        CONN_SNI=${SELF_DOMAIN:-bing.com}
+    fi
+}
+
 build_share_url() {
     local TAG=$1
     local IP=$2
     load_secrets
-    
-    local CONN_ADDR=$IP
-    local INSECURE=1
-    local SNI_URL=""
-    
-    local CERT_PATH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.certificate_path // empty' $CONFIG_FILE)
-    if [[ "$CERT_PATH" == *"/real.cer" ]]; then
-        CONN_ADDR=$REAL_DOMAIN
-        INSECURE=0
-        SNI_URL="&sni=${REAL_DOMAIN}"
-    elif [[ "$CERT_PATH" == *"/self.cer" ]]; then
-        SNI_URL="&sni=${SELF_DOMAIN:-bing.com}"
-    fi
-    
-    local TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' $CONFIG_FILE)
-    local PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port' $CONFIG_FILE)
-    
+
+    local -a M
+    mapfile -t M < <(node_read "$TAG")
+    [ "${#M[@]}" -lt 9 ] && { echo -e "${RED}[读取节点 $TAG 失败]${PLAIN}"; return; }
+    local TYPE=${M[0]} PORT=${M[1]} CERT_PATH=${M[2]}
+    local N_UUID=${M[3]} N_PASS=${M[4]} SNI=${M[5]} SID=${M[6]}
+    local IS_REALITY=${M[7]} IS_WS=${M[8]}
+
+    resolve_conn "$CERT_PATH" "$IP"
+    local SNI_URL="${CONN_SNI:+&sni=${CONN_SNI}}"
+
     local IP_URI=$(wrap_ipv6 "$IP")
     local CONN_ADDR_URI=$(wrap_ipv6 "$CONN_ADDR")
-    
+
     case "$TYPE" in
         vless)
-            local AUTH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].uuid' $CONFIG_FILE)
-            if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1; then
+            if [ "$IS_REALITY" == "1" ]; then
                 if [ -z "$IP" ]; then echo -e "${RED}[获取公网IP异常，无法生成 VLESS-REALITY 链接]${PLAIN}"; return; fi
-                local SNI=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.server_name' $CONFIG_FILE)
-                local SID=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.short_id[0]' $CONFIG_FILE)
                 local var_name="REALITY_PUB_${PORT}"
                 local PUB="${!var_name}"
-                echo "vless://${AUTH}@${IP_URI}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-            elif jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
+                echo "vless://${N_UUID}@${IP_URI}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
+            elif [ "$IS_WS" == "1" ]; then
                 local var_ip="ARGO_IP_${PORT}"
                 local var_dom="ARGO_DOMAIN_${PORT}"
                 local A_IP="${!var_ip}"
                 local A_DOM="${!var_dom}"
                 if [ -z "$A_IP" ]; then echo -e "${RED}[无法读取 Argo IP，无法生成链接]${PLAIN}"; return; fi
                 local A_IP_URI=$(wrap_ipv6 "$A_IP")
-                echo "vless://${AUTH}@${A_IP_URI}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
+                echo "vless://${N_UUID}@${A_IP_URI}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
             fi
             ;;
         hysteria2)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[获取连接地址失败，无法生成 Hysteria2 链接]${PLAIN}"; return; fi
-            local AUTH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password // empty' $CONFIG_FILE)
-            local AUTH_ENC=$(url_encode "$AUTH")
-            echo "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}" 
+            local AUTH_ENC=$(url_encode "$N_PASS")
+            echo "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
         tuic)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[获取连接地址失败，无法生成 TUIC 链接]${PLAIN}"; return; fi
-            local T_UUID=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].uuid // empty' $CONFIG_FILE)
-            local T_PASS=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password // empty' $CONFIG_FILE)
-            local T_UUID_ENC=$(url_encode "$T_UUID")
-            local T_PASS_ENC=$(url_encode "$T_PASS")
-            echo "tuic://${T_UUID_ENC}:${T_PASS_ENC}@${CONN_ADDR_URI}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}" 
+            local T_UUID_ENC=$(url_encode "$N_UUID")
+            local T_PASS_ENC=$(url_encode "$N_PASS")
+            echo "tuic://${T_UUID_ENC}:${T_PASS_ENC}@${CONN_ADDR_URI}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
         anytls)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[获取连接地址失败，无法生成 AnyTLS 链接]${PLAIN}"; return; fi
-            local AUTH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password // empty' $CONFIG_FILE)
-            local AUTH_ENC=$(url_encode "$AUTH")
-            echo "anytls://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}" 
+            local AUTH_ENC=$(url_encode "$N_PASS")
+            echo "anytls://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
     esac
 }
@@ -699,43 +818,37 @@ print_config_detail() {
     local TAG=$1
     local IP=$(get_ip)
     load_secrets
-    
-    local CERT_PATH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.certificate_path // empty' $CONFIG_FILE)
-    local CONN_ADDR=$IP
+
+    local -a M
+    mapfile -t M < <(node_read "$TAG")
+    [ "${#M[@]}" -lt 9 ] && { echo -e "${RED}[读取节点 $TAG 失败]${PLAIN}"; return; }
+    local TYPE=${M[0]} PORT=${M[1]} CERT_PATH=${M[2]}
+    local N_UUID=${M[3]} N_PASS=${M[4]} SNI=${M[5]} SID=${M[6]}
+    local IS_REALITY=${M[7]} IS_WS=${M[8]}
+
+    resolve_conn "$CERT_PATH" "$IP"
     local INSECURE_TEXT="true"
-    local SNI_VAL=""
-    if [[ "$CERT_PATH" == *"/real.cer" ]]; then
-        CONN_ADDR=$REAL_DOMAIN
-        INSECURE_TEXT="false"
-        SNI_VAL=$REAL_DOMAIN
-    elif [[ "$CERT_PATH" == *"/self.cer" ]]; then
-        SNI_VAL=${SELF_DOMAIN:-bing.com}
-    fi
-    
-    local TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' $CONFIG_FILE)
-    local PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port' $CONFIG_FILE)
-    
+    [ "$CONN_INSECURE" -eq 0 ] && INSECURE_TEXT="false"
+    local SNI_VAL=$CONN_SNI
+
     echo -e "\n-------------- ${YELLOW}$TAG${PLAIN} -------------"
     echo -e "协议 (protocol)\t\t\t= $TYPE"
-    
+
     case "$TYPE" in
         vless)
-            local AUTH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].uuid' $CONFIG_FILE)
-            if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1; then
-                local SNI=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.server_name' $CONFIG_FILE)
-                local SID=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.short_id[0]' $CONFIG_FILE)
+            if [ "$IS_REALITY" == "1" ]; then
                 local var_name="REALITY_PUB_${PORT}"
                 local PUB="${!var_name}"
                 local IP_DISP=$(wrap_ipv6 "$IP")
                 echo -e "地址 (address)\t\t\t= ${IP_DISP:-[获取公网IP失败]}"
                 echo -e "端口 (port)\t\t\t= $PORT"
-                echo -e "用户ID (id)\t\t\t= $AUTH"
+                echo -e "用户ID (id)\t\t\t= $N_UUID"
                 echo -e "流控 (flow)\t\t\t= xtls-rprx-vision"
                 echo -e "传输层安全 (TLS)\t\t= reality"
                 echo -e "伪装域名 (sni)\t\t\t= $SNI"
                 echo -e "公钥 (pbk)\t\t\t= $PUB"
                 echo -e "ShortId (sid)\t\t\t= $SID"
-            elif jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
+            elif [ "$IS_WS" == "1" ]; then
                 local var_ip="ARGO_IP_${PORT}"
                 local var_dom="ARGO_DOMAIN_${PORT}"
                 local A_IP="${!var_ip}"
@@ -743,7 +856,7 @@ print_config_detail() {
                 local A_IP_DISP=$(wrap_ipv6 "$A_IP")
                 echo -e "地址 (address)\t\t\t= $A_IP_DISP"
                 echo -e "端口 (port)\t\t\t= 443"
-                echo -e "用户ID (id)\t\t\t= $AUTH"
+                echo -e "用户ID (id)\t\t\t= $N_UUID"
                 echo -e "传输协议 (network)\t\t= ws"
                 echo -e "传输层安全 (TLS)\t\t= tls"
                 echo -e "伪装域名 (sni)\t\t\t= $A_DOM"
@@ -752,24 +865,21 @@ print_config_detail() {
             fi
             ;;
         hysteria2)
-            local AUTH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password' $CONFIG_FILE)
             local CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
-            echo -e "密码 (password)\t\t\t= $AUTH"
+            echo -e "密码 (password)\t\t\t= $N_PASS"
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "应用层协议协商 (Alpn)\t\t= h3"
             echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
             [ -n "$SNI_VAL" ] && echo -e "伪装域名 (sni)\t\t\t= $SNI_VAL"
             ;;
         tuic)
-            local T_UUID=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].uuid' $CONFIG_FILE)
-            local T_PASS=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password' $CONFIG_FILE)
             local CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
-            echo -e "用户ID (id)\t\t\t= $T_UUID"
-            echo -e "密码 (password)\t\t\t= $T_PASS"
+            echo -e "用户ID (id)\t\t\t= $N_UUID"
+            echo -e "密码 (password)\t\t\t= $N_PASS"
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "应用层协议协商 (Alpn)\t\t= h3"
             echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
@@ -777,24 +887,24 @@ print_config_detail() {
             [ -n "$SNI_VAL" ] && echo -e "伪装域名 (sni)\t\t\t= $SNI_VAL"
             ;;
         anytls)
-            local AUTH=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .users[0].password' $CONFIG_FILE)
             local CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
-            echo -e "密码 (password)\t\t\t= $AUTH"
+            echo -e "密码 (password)\t\t\t= $N_PASS"
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "跳过证书验证 (allowInsecure)\t= $INSECURE_TEXT"
             [ -n "$SNI_VAL" ] && echo -e "伪装域名 (sni)\t\t\t= $SNI_VAL"
             ;;
     esac
-    
+
     echo -e "------------- 链接 (URL) -------------"
     build_share_url "$TAG" "$IP"
-    
-    if [ "$INSECURE_TEXT" == "true" ] && ! jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1 && ! jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
+
+    if [ "$INSECURE_TEXT" == "true" ] && [ "$IS_REALITY" != "1" ] && [ "$IS_WS" != "1" ]; then
         echo -e "\n${YELLOW}警告! 此节点使用自签名证书，请确保客户端已开启「跳过证书验证」！${PLAIN}\n"
     fi
 }
+
 
 select_inbound() {
     local old_IFS=$IFS
@@ -823,6 +933,37 @@ select_inbound() {
         TAG=${TAGS[$idx]}
         return 0
     done
+}
+
+warn_port_shared() {
+    local port=$1 proto=$2 self_tag=$3
+    [ -z "$proto" ] && return 1
+    local other
+    other=$(jq -r --argjson p "$port" --arg self "${self_tag:-}" '
+      .inbounds[]
+      | select(.listen_port == $p)
+      | select(.tag != $self)
+      | "\(.tag)|\(.type)|\(if .transport.type == "ws" then "ws" else "" end)"
+    ' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$other" ] && return 1
+
+    local found=1
+    while IFS='|' read -r o_tag o_type o_ws; do
+        [ -z "$o_tag" ] && continue
+        local o_proto=""
+        case "$o_type" in
+            hysteria2|tuic) o_proto="udp" ;;
+            anytls)         o_proto="tcp" ;;
+            vless)          [ "$o_ws" != "ws" ] && o_proto="tcp" ;;
+        esac
+        if [ -n "$o_proto" ] && [ "$o_proto" != "$proto" ]; then
+            echo -e "\n${YELLOW}提示: 端口 ${port} 已被节点 ${o_tag} 使用 (${o_proto^^})，本节点用的是 ${proto^^}。${PLAIN}"
+            echo -e "${YELLOW}内核允许 TCP/UDP 同号共存，但请确认防火墙与云服务商/NAT 端口映射${PLAIN}"
+            echo -e "${YELLOW}对 ${proto^^} 和 ${o_proto^^} 两种协议都放行了 ${port}，否则其中一个节点会连不上。${PLAIN}"
+            found=0
+        fi
+    done <<< "$other"
+    return $found
 }
 
 add_config() {
@@ -865,6 +1006,7 @@ add_config() {
             break
         done
         echo -e "使用: ${GREEN}${PORT}${PLAIN}"
+        warn_port_shared "$PORT" "$f_proto"
         
         local raw_hostname=$(hostname 2>/dev/null || echo "vps")
         local HOST_NAME=$(echo "$raw_hostname" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')
@@ -967,7 +1109,7 @@ add_config() {
                     fi
                     
                     if [ "$OS_TYPE" == "alpine" ]; then
-                        cat > "/etc/init.d/cloudflared-${TAG}" << 'EOF'
+                        ( umask 077; cat > "/etc/init.d/cloudflared-${TAG}" << 'EOF'
 #!/sbin/openrc-run
 name="cloudflared-@@SB_TAG@@"
 command="/usr/local/bin/cloudflared"
@@ -976,13 +1118,14 @@ command_background=true
 pidfile="/var/run/cloudflared-@@SB_TAG@@.pid"
 depend() { need net; }
 EOF
+                        )
                         sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/init.d/cloudflared-${TAG}"
                         sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/init.d/cloudflared-${TAG}"
-                        chmod +x "/etc/init.d/cloudflared-${TAG}"
+                        chmod 700 "/etc/init.d/cloudflared-${TAG}"
                         rc-update add "cloudflared-${TAG}" default >/dev/null 2>&1
                         rc-service "cloudflared-${TAG}" restart >/dev/null 2>&1
                     else
-                        cat > "/etc/systemd/system/cloudflared-${TAG}.service" << 'EOF'
+                        ( umask 077; cat > "/etc/systemd/system/cloudflared-${TAG}.service" << 'EOF'
 [Unit]
 Description=cloudflared tunnel for @@SB_TAG@@
 After=network.target
@@ -993,8 +1136,10 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
+                        )
                         sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/systemd/system/cloudflared-${TAG}.service"
                         sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/systemd/system/cloudflared-${TAG}.service"
+                        chmod 600 "/etc/systemd/system/cloudflared-${TAG}.service"
                         systemctl daemon-reload >/dev/null 2>&1
                         systemctl enable "cloudflared-${TAG}" --now >/dev/null 2>&1
                     fi
@@ -1188,14 +1333,28 @@ modify_config() {
                 elif [ "$TYPE" == "anytls" ]; then f_proto="tcp"
                 fi
 
+                if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
+                    echo -e "\n${YELLOW}注意: 这是 Argo 节点，入口由 Cloudflare Tunnel 提供。${PLAIN}"
+                    echo -e "${YELLOW}改完本地端口后，必须去 Cloudflare Zero Trust 后台把该 Tunnel 的${PLAIN}"
+                    echo -e "${YELLOW}Public Hostname (Ingress) 目标同步改成 localhost:<新端口>，${PLAIN}"
+                    echo -e "${YELLOW}否则节点会立即失效(隧道返回 502)。${PLAIN}"
+                    read -p "确认继续修改端口？(y/n) [默认: n]: " argo_go
+                    if [[ "${argo_go:-n}" != "y" && "${argo_go:-n}" != "Y" ]]; then
+                        echo -e "${CYAN}已取消。${PLAIN}"
+                        pause
+                        continue
+                    fi
+                fi
+
                 local NEW_PORT
                 while true; do
                     read -p "请输入新端口 [默认随机]: " NEW_PORT
                     NEW_PORT=${NEW_PORT:-$(rand_port)}
                     if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then echo -e "${RED}错误输入!${PLAIN}"; continue; fi
-                    if check_port "$NEW_PORT" "$f_proto"; then echo -e "${RED}端口占用!${PLAIN}"; continue; fi
+                    if [ "$NEW_PORT" != "$OLD_PORT" ] && check_port "$NEW_PORT" "$f_proto"; then echo -e "${RED}端口占用!${PLAIN}"; continue; fi
                     break
                 done
+                warn_port_shared "$NEW_PORT" "$f_proto" "$TAG"
                 
                 if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .listen_port) = $p' --arg tag "$TAG" --argjson p "$NEW_PORT"; then
                     rm -f ${CONFIG_FILE}.bak
@@ -1221,13 +1380,17 @@ modify_config() {
                 if ! restart_service; then 
                     echo -e "${RED}操作失败，已还原配置！${PLAIN}"
                     mv ${CONFIG_FILE}.bak $CONFIG_FILE
-                    remove_secret "REALITY_PUB_${NEW_PORT}"
-                    remove_secret "ARGO_IP_${NEW_PORT}"
-                    remove_secret "ARGO_DOMAIN_${NEW_PORT}"
+                    if [ "$OLD_PORT" != "$NEW_PORT" ]; then
+                        remove_secret "REALITY_PUB_${NEW_PORT}"
+                        remove_secret "ARGO_IP_${NEW_PORT}"
+                        remove_secret "ARGO_DOMAIN_${NEW_PORT}"
+                    fi
                 else
-                    remove_secret "REALITY_PUB_${OLD_PORT}"
-                    remove_secret "ARGO_IP_${OLD_PORT}"
-                    remove_secret "ARGO_DOMAIN_${OLD_PORT}"
+                    if [ "$OLD_PORT" != "$NEW_PORT" ]; then
+                        remove_secret "REALITY_PUB_${OLD_PORT}"
+                        remove_secret "ARGO_IP_${OLD_PORT}"
+                        remove_secret "ARGO_DOMAIN_${OLD_PORT}"
+                    fi
                     rm -f ${CONFIG_FILE}.bak
                     
                     echo -e "${GREEN}端口已更改为: $NEW_PORT${PLAIN}"
@@ -1324,7 +1487,9 @@ del_config() {
         
         local TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' $CONFIG_FILE)
         local PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port' $CONFIG_FILE)
-
+        local IS_ARGO=0
+        if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then IS_ARGO=1; fi
+        
         cp $CONFIG_FILE ${CONFIG_FILE}.bak
         
         if ! apply_jq_config 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$TAG"; then
@@ -1341,9 +1506,6 @@ del_config() {
         fi
         
         rm -f ${CONFIG_FILE}.bak
-        
-        local IS_ARGO=0
-        if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then IS_ARGO=1; fi
         
         local f_proto=""
         if [[ "$TYPE" == "vless" && "$IS_ARGO" -eq 0 ]]; then f_proto="tcp"
@@ -1492,12 +1654,21 @@ update_manage() {
                     if wget --show-progress -qO $UP_TMP/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${NEW_VER}/sing-box-${NEW_VER}-linux-${SB_ARCH}.tar.gz"; then
                         if tar -xzf $UP_TMP/sb.tar.gz -C $UP_TMP; then
                             if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box stop >/dev/null 2>&1; else systemctl stop sing-box >/dev/null 2>&1; fi
-                            rm -f /usr/local/bin/sing-box
-                            mv $UP_TMP/sing-box-${NEW_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/sing-box
+                            cp -f /usr/local/bin/sing-box "$UP_TMP/sing-box.old" 2>/dev/null
+                            mv -f $UP_TMP/sing-box-${NEW_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/sing-box
                             chmod +x /usr/local/bin/sing-box
-                            restart_service
-                            GLOBAL_LATEST_VER="$NEW_VER"
-                            echo -e "\n${GREEN}内核更新成功！当前版本: v${NEW_VER}${PLAIN}"
+                            if restart_service; then
+                                GLOBAL_LATEST_VER="$NEW_VER"
+                                echo -e "\n${GREEN}内核更新成功！当前版本: v${NEW_VER}${PLAIN}"
+                            elif [ -s "$UP_TMP/sing-box.old" ]; then
+                                mv -f "$UP_TMP/sing-box.old" /usr/local/bin/sing-box
+                                chmod +x /usr/local/bin/sing-box
+                                restart_service
+                                echo -e "\n${RED}v${NEW_VER} 启动失败(配置可能不被新版接受)，已回滚到原内核。${PLAIN}"
+                                echo -e "${YELLOW}请手动执行 sing-box check -c ${CONFIG_FILE} 查看具体报错。${PLAIN}"
+                            else
+                                echo -e "\n${RED}v${NEW_VER} 启动失败，且旧内核备份不可用！请手动排查。${PLAIN}"
+                            fi
                         else
                             echo -e "\n${RED}解压失败，已安全回退并保留原内核。${PLAIN}"
                         fi
@@ -1508,15 +1679,11 @@ update_manage() {
                     pause; break ;;
                 2)
                     echo -e "\n${CYAN}正在拉取最新脚本代码...${PLAIN}"
-                    local SCRIPT_UP_TMP=$(mktemp)
-                    if curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o "$SCRIPT_UP_TMP" && [ -s "$SCRIPT_UP_TMP" ]; then
-                        mv "$SCRIPT_UP_TMP" /usr/local/bin/sb
-                        chmod +x /usr/local/bin/sb
+                    if fetch_script; then
                         echo -e "${GREEN}脚本代码更新成功！请重新运行 sb 命令。${PLAIN}"
                         exit 0
                     else
-                        echo -e "${RED}下载脚本失败，网络异常！更新中止。${PLAIN}"
-                        rm -f "$SCRIPT_UP_TMP"
+                        echo -e "${RED}下载脚本失败或内容校验不通过！更新中止。${PLAIN}"
                     fi
                     ;;
                 0) return ;;
@@ -1569,67 +1736,32 @@ config_outbound() {
         echo -e " 0) 返回\n"
         read -p "请选择 [0-3]: " out_idx
         
-        local SB_VER=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         local USE_NEW_FORMAT=0
-        if [ -n "$SB_VER" ]; then
-            local major=$(echo "$SB_VER" | cut -d. -f1)
-            local minor=$(echo "$SB_VER" | cut -d. -f2)
-            if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]]; then
-                if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; }; then
-                    USE_NEW_FORMAT=1
-                fi
-            fi
-        else
+        if ! /usr/local/bin/sing-box version >/dev/null 2>&1 || sb_ge_112; then
             USE_NEW_FORMAT=1
         fi
         
-        local jq_success=0
+        local strategy=""
         case "$out_idx" in
-            1)
-                cp $CONFIG_FILE ${CONFIG_FILE}.bak
-                if [ "$USE_NEW_FORMAT" -eq 1 ]; then
-                    if apply_jq_config '
-                      .dns.servers |= (. // []) |
-                      if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
-                        .dns.servers += [{"tag": "dns-local", "type": "local"}]
-                      else . end |
-                      (.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"server": "dns-local", "strategy": "ipv4_only"})
-                    '; then
-                        jq_success=1
-                    fi
-                else
-                    if apply_jq_config '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv4_only"'; then
-                        jq_success=1
-                    fi
-                fi
-                ;;
-            2)
-                cp $CONFIG_FILE ${CONFIG_FILE}.bak
-                if [ "$USE_NEW_FORMAT" -eq 1 ]; then
-                    if apply_jq_config '
-                      .dns.servers |= (. // []) |
-                      if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
-                        .dns.servers += [{"tag": "dns-local", "type": "local"}]
-                      else . end |
-                      (.outbounds[] | select(.tag=="direct")) |= (del(.domain_strategy) | .domain_resolver = {"server": "dns-local", "strategy": "ipv6_only"})
-                    '; then
-                        jq_success=1
-                    fi
-                else
-                    if apply_jq_config '(.outbounds[] | select(.tag=="direct")).domain_strategy = "ipv6_only"'; then
-                        jq_success=1
-                    fi
-                fi
-                ;;
-            3)
-                cp $CONFIG_FILE ${CONFIG_FILE}.bak
-                if apply_jq_config '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver)'; then
-                    jq_success=1
-                fi
-                ;;
+            1) strategy="ipv4_only" ;;
+            2) strategy="ipv6_only" ;;
+            3) strategy="auto" ;;
             0) return ;;
             *) echo -e "${RED}输入错误!${PLAIN}"; sleep 1; continue ;;
         esac
+
+        local jq_success=0
+        cp $CONFIG_FILE ${CONFIG_FILE}.bak
+        if [ "$strategy" == "auto" ]; then
+            apply_jq_config '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver)' && jq_success=1
+        elif [ "$USE_NEW_FORMAT" -eq 1 ]; then
+            apply_jq_config "
+              $JQ_DNS_LOCAL |
+              (.outbounds[] | select(.tag==\"direct\")) |= (del(.domain_strategy) | .domain_resolver = {\"server\": \"dns-local\", \"strategy\": \$s})
+            " --arg s "$strategy" && jq_success=1
+        else
+            apply_jq_config '(.outbounds[] | select(.tag=="direct")).domain_strategy = $s' --arg s "$strategy" && jq_success=1
+        fi
 
         if [ "$jq_success" -eq 0 ]; then
             rm -f ${CONFIG_FILE}.bak
@@ -1688,8 +1820,12 @@ uninstall_all() {
         
         if [ -f "$HOME/.acme.sh/acme.sh" ]; then
             load_secrets
-            if [ -n "$REAL_DOMAIN" ]; then
+            # 仅移除本脚本自己申请的证书；复用用户已有证书时 REAL_CERT_OWNED=0，
+            # 此时删除会连带删掉用户原有的自动续期记录，导致其它服务的证书到期失效。
+            if [ -n "$REAL_DOMAIN" ] && [ "${REAL_CERT_OWNED:-1}" == "1" ]; then
                 $HOME/.acme.sh/acme.sh --remove -d "$REAL_DOMAIN" >/dev/null 2>&1
+            elif [ -n "$REAL_DOMAIN" ]; then
+                echo -e "${YELLOW}证书 ${REAL_DOMAIN} 为复用的已有证书，已保留其 acme.sh 续期记录。${PLAIN}"
             fi
         fi
         
@@ -1771,15 +1907,11 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
         case "$pre_choice" in
             1)
                 echo -e "${CYAN}正在拉取最新脚本代码...${PLAIN}"
-                SCRIPT_TMP=$(mktemp)
-                if curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o "$SCRIPT_TMP" && [ -s "$SCRIPT_TMP" ]; then
-                    mv "$SCRIPT_TMP" /usr/local/bin/sb
-                    chmod +x /usr/local/bin/sb
+                if fetch_script; then
                     echo -e "${GREEN}脚本代码更新成功！请执行 sb 命令进入面板。${PLAIN}"
                     exit 0
                 else
-                    echo -e "${RED}下载脚本失败，网络异常！${PLAIN}"
-                    rm -f "$SCRIPT_TMP"
+                    echo -e "${RED}下载脚本失败或内容校验不通过！${PLAIN}"
                     exit 1
                 fi
                 ;;
@@ -1789,16 +1921,11 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
         esac
     else
         echo -e "${CYAN}==> 正在将管理脚本写入到全局环境...${PLAIN}"
-        SCRIPT_TMP=$(mktemp)
-        if curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o "$SCRIPT_TMP" && [ -s "$SCRIPT_TMP" ]; then
-            mv "$SCRIPT_TMP" /usr/local/bin/sb
-            chmod +x /usr/local/bin/sb
-            rm -f sb.sh install.sh 2>/dev/null
+        if fetch_script; then
             echo -e "\n${GREEN}==> 脚本安装完成！以后可随时输入 ${YELLOW}sb${GREEN} 快捷调用本面板。${PLAIN}"
             sleep 2
         else
-            echo -e "${RED}初始化脚本下载失败，请检查网络！${PLAIN}"
-            rm -f "$SCRIPT_TMP"
+            echo -e "${RED}初始化脚本下载失败或内容校验不通过，请检查网络！${PLAIN}"
             exit 1
         fi
     fi
