@@ -301,8 +301,95 @@ migrate_certs() {
     fi
 }
 
+kernel_ok() {
+    [ -x /usr/local/bin/sing-box ] || return 1
+    # 用命令替换+子shell调用，避免内核已损坏时 shell 作业控制把
+    # "Bus error/Segmentation fault" 直接打到终端造成误导性噪音。
+    local ver
+    ver=$( ( /usr/local/bin/sing-box version ) 2>/dev/null ) || return 1
+    echo "$ver" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' || return 1
+    return 0
+}
+
+# fetch_url <url> <输出路径>
+# 兼容 GNU wget / BusyBox wget(Alpine) / curl，避免 --show-progress 在 BusyBox 上报错。
+fetch_url() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --retry 2 --connect-timeout 15 -o "$out" "$url" && return 0
+        return 1
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        if wget --help 2>&1 | grep -q -- '--show-progress'; then
+            wget --show-progress -qO "$out" "$url" && return 0
+        else
+            wget -O "$out" "$url" && return 0
+        fi
+    fi
+    return 1
+}
+
+# install_kernel <版本号> [restart|norestart]
+# 下载指定版本内核并覆盖安装。restart 模式下会重启服务，启动失败自动回滚旧内核。
+install_kernel() {
+    local ver="$1"
+    local mode="${2:-restart}"
+    [ -z "$ver" ] && return 1
+
+    local tmp
+    tmp=$(mktemp -d) || return 1
+    local url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${SB_ARCH}.tar.gz"
+
+    echo -e "${CYAN}==> 正在下载 sing-box v${ver} (${SB_ARCH})...${PLAIN}"
+    if ! fetch_url "$url" "$tmp/sb.tar.gz"; then
+        echo -e "${RED}下载失败，已保留原内核。请检查网络。${PLAIN}"
+        rm -rf "$tmp"; return 1
+    fi
+    if ! tar -xzf "$tmp/sb.tar.gz" -C "$tmp" 2>/dev/null; then
+        echo -e "${RED}解压失败，已保留原内核。${PLAIN}"
+        rm -rf "$tmp"; return 1
+    fi
+    local newbin="$tmp/sing-box-${ver}-linux-${SB_ARCH}/sing-box"
+    if [ ! -s "$newbin" ]; then
+        echo -e "${RED}压缩包内未找到内核文件，已保留原内核。${PLAIN}"
+        rm -rf "$tmp"; return 1
+    fi
+
+    [ -s /usr/local/bin/sing-box ] && cp -f /usr/local/bin/sing-box "$tmp/sing-box.old" 2>/dev/null
+
+    if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box stop >/dev/null 2>&1; else systemctl stop sing-box >/dev/null 2>&1; fi
+    if ! mv -f "$newbin" /usr/local/bin/sing-box; then
+        echo -e "${RED}写入 /usr/local/bin/sing-box 失败！${PLAIN}"
+        rm -rf "$tmp"; return 1
+    fi
+    chmod +x /usr/local/bin/sing-box
+
+    if [ "$mode" == "norestart" ]; then
+        echo -e "${GREEN}==> 内核 v${ver} 安装完毕！${PLAIN}"
+        rm -rf "$tmp"; return 0
+    fi
+
+    if restart_service; then
+        GLOBAL_LATEST_VER="$ver"
+        echo -e "${GREEN}==> 内核已覆盖为 v${ver}，服务运行正常。${PLAIN}"
+        rm -rf "$tmp"; return 0
+    fi
+
+    if [ -s "$tmp/sing-box.old" ]; then
+        mv -f "$tmp/sing-box.old" /usr/local/bin/sing-box
+        chmod +x /usr/local/bin/sing-box
+        restart_service
+        echo -e "${RED}v${ver} 启动失败(配置可能不被新版接受)，已回滚到原内核。${PLAIN}"
+        echo -e "${YELLOW}可执行 sing-box check -c ${CONFIG_FILE} 查看具体报错。${PLAIN}"
+    else
+        echo -e "${RED}v${ver} 启动失败，且旧内核备份不可用！请手动排查。${PLAIN}"
+    fi
+    rm -rf "$tmp"
+    return 1
+}
+
 init_base() {
-    if ! command -v jq &> /dev/null || [ ! -f "/usr/local/bin/sing-box" ]; then
+    if ! command -v jq &> /dev/null || ! kernel_ok; then
         echo -e "${CYAN}==> 正在准备环境与内核...${PLAIN}"
         if [ "$OS_TYPE" == "alpine" ]; then
             apk update >/dev/null 2>&1
@@ -336,25 +423,10 @@ init_base() {
                 exit 1
             fi
         fi
-
         echo -e "${CYAN}==> 开始下载 v${VERSION} 内核...${PLAIN}"
-        
-        local INIT_TMP=$(mktemp -d)
-        if wget --show-progress -qO $INIT_TMP/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"; then
-            if tar -xzf $INIT_TMP/sing-box.tar.gz -C $INIT_TMP; then
-                mv -f $INIT_TMP/sing-box-${VERSION}-linux-${SB_ARCH}/sing-box /usr/local/bin/sing-box
-                chmod +x /usr/local/bin/sing-box
-                echo -e "${GREEN}==> 内核下载并解压完毕！${PLAIN}"
-            else
-                echo -e "${RED}解压失败！${PLAIN}"
-                exit 1
-            fi
-        else
-            echo -e "${RED}下载内核失败！请检查网络。${PLAIN}"
-            exit 1
-        fi
-        rm -rf $INIT_TMP
+        install_kernel "$VERSION" norestart || exit 1
     fi
+
 
     mkdir -p $CONFIG_DIR $CERT_DIR || return 1
     
@@ -1099,7 +1171,7 @@ add_config() {
                         local TMP_CF=$(mktemp)
                         local cf_arch="amd64"
                         [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && cf_arch="arm64"
-                        if wget --show-progress -qO $TMP_CF "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" || curl -sL -o $TMP_CF "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"; then
+                        if fetch_url "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" "$TMP_CF"; then
                             mv $TMP_CF /usr/local/bin/cloudflared
                             chmod +x /usr/local/bin/cloudflared
                         else
@@ -1631,7 +1703,7 @@ update_manage() {
         fi
         local NEW_VER=$(get_latest_version)
         local SB_UPDATE_TEXT="更新 sing-box 内核"
-        if [ -n "$NEW_VER" ]; then
+        if kernel_ok && [ -n "$NEW_VER" ]; then
             if [ "$CUR_VER" != "$NEW_VER" ]; then SB_UPDATE_TEXT="更新 sing-box 内核 ${GREEN}[发现新版: v${NEW_VER}]${PLAIN}"
             else SB_UPDATE_TEXT="更新 sing-box 内核 ${YELLOW}[已是最新: v${CUR_VER}]${PLAIN}"
             fi
@@ -1641,41 +1713,17 @@ update_manage() {
         echo -e "选择: 更新\n"
         echo -e " 1) ${SB_UPDATE_TEXT}"
         echo -e " 2) 更新脚本"
+        echo -e " 3) 强制覆盖重装内核"
         echo -e " 0) 返回\n"
         while true; do
-            read -p "请选择 [0-2]: " up_idx
+            read -p "请选择 [0-3]: " up_idx
             case "$up_idx" in
                 1)
                     if [ -z "$NEW_VER" ]; then echo -e "${RED}获取最新版本失败！API 受限或网络超时。${PLAIN}"; pause; break; fi
-                    if [ "$CUR_VER" == "$NEW_VER" ]; then echo -e "\n${GREEN}当前已是最新，无需更新！${PLAIN}"; pause; break; fi
+                    if kernel_ok && [ "$CUR_VER" == "$NEW_VER" ]; then echo -e "\n${GREEN}当前已是最新，无需更新！${PLAIN}"; pause; break; fi
                     
                     echo -e "\n${YELLOW}即将更新内核至 v${NEW_VER}...${PLAIN}"
-                    local UP_TMP=$(mktemp -d)
-                    if wget --show-progress -qO $UP_TMP/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${NEW_VER}/sing-box-${NEW_VER}-linux-${SB_ARCH}.tar.gz"; then
-                        if tar -xzf $UP_TMP/sb.tar.gz -C $UP_TMP; then
-                            if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box stop >/dev/null 2>&1; else systemctl stop sing-box >/dev/null 2>&1; fi
-                            cp -f /usr/local/bin/sing-box "$UP_TMP/sing-box.old" 2>/dev/null
-                            mv -f $UP_TMP/sing-box-${NEW_VER}-linux-${SB_ARCH}/sing-box /usr/local/bin/sing-box
-                            chmod +x /usr/local/bin/sing-box
-                            if restart_service; then
-                                GLOBAL_LATEST_VER="$NEW_VER"
-                                echo -e "\n${GREEN}内核更新成功！当前版本: v${NEW_VER}${PLAIN}"
-                            elif [ -s "$UP_TMP/sing-box.old" ]; then
-                                mv -f "$UP_TMP/sing-box.old" /usr/local/bin/sing-box
-                                chmod +x /usr/local/bin/sing-box
-                                restart_service
-                                echo -e "\n${RED}v${NEW_VER} 启动失败(配置可能不被新版接受)，已回滚到原内核。${PLAIN}"
-                                echo -e "${YELLOW}请手动执行 sing-box check -c ${CONFIG_FILE} 查看具体报错。${PLAIN}"
-                            else
-                                echo -e "\n${RED}v${NEW_VER} 启动失败，且旧内核备份不可用！请手动排查。${PLAIN}"
-                            fi
-                        else
-                            echo -e "\n${RED}解压失败，已安全回退并保留原内核。${PLAIN}"
-                        fi
-                    else
-                        echo -e "\n${RED}下载失败，已安全回退并保留原内核。请检查网络。${PLAIN}"
-                    fi
-                    rm -rf $UP_TMP
+                    install_kernel "$NEW_VER" restart
                     pause; break ;;
                 2)
                     echo -e "\n${CYAN}正在拉取最新脚本代码...${PLAIN}"
@@ -1686,6 +1734,19 @@ update_manage() {
                         echo -e "${RED}下载脚本失败或内容校验不通过！更新中止。${PLAIN}"
                     fi
                     ;;
+                3)
+                    if [ -z "$NEW_VER" ]; then
+                        read -p "获取最新版本失败，请手动输入要安装的版本号 (如 1.10.1): " NEW_VER
+                        [ -z "$NEW_VER" ] && { echo -e "${RED}未输入版本号，已取消。${PLAIN}"; pause; break; }
+                    fi
+                    echo -e "\n${YELLOW}将强制覆盖安装 v${NEW_VER}（无论当前版本是否相同）。${PLAIN}"
+                    read -p "确认继续？(y/n) [默认: y]: " fc
+                    if [[ "${fc:-y}" == "y" || "${fc:-y}" == "Y" ]]; then
+                        install_kernel "$NEW_VER" restart
+                    else
+                        echo -e "${YELLOW}已取消。${PLAIN}"
+                    fi
+                    pause; break ;;
                 0) return ;;
                 *) echo -e "${RED}输入错误!${PLAIN}" ;;
             esac
@@ -1899,21 +1960,55 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
     if [ -f "/usr/local/bin/sb" ]; then
         clear
         echo -e "${GREEN}检测到 sing-box 管理脚本已经安装！${PLAIN}\n"
-        echo -e " 1. 更新覆盖脚本"
-        echo -e " 2. 卸载脚本"
+        echo -e " 1. 更新覆盖脚本 + 内核"
+        echo -e " 2. 卸载脚本 + 内核"
         echo -e " 3. 进入面板"
         echo -e " 4. 退出\n"
         read -p "请选择 [1-4]: " pre_choice
         case "$pre_choice" in
             1)
                 echo -e "${CYAN}正在拉取最新脚本代码...${PLAIN}"
-                if fetch_script; then
-                    echo -e "${GREEN}脚本代码更新成功！请执行 sb 命令进入面板。${PLAIN}"
-                    exit 0
-                else
+                if ! fetch_script; then
                     echo -e "${RED}下载脚本失败或内容校验不通过！${PLAIN}"
                     exit 1
                 fi
+                echo -e "${GREEN}脚本代码更新成功！${PLAIN}\n"
+
+                CUR_K="未安装"
+                if kernel_ok; then
+                    CUR_K=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+                fi
+                NEW_K=$(get_latest_version)
+                echo -e "${CYAN}当前内核: ${CUR_K}    最新版本: ${NEW_K:-获取失败}${PLAIN}"
+
+                if [ -z "$NEW_K" ]; then
+                    echo -e "${YELLOW}获取最新内核版本失败，已跳过内核覆盖。${PLAIN}"
+                    echo -e "${YELLOW}可稍后执行 sb 进入面板，用 [7) 更新] 单独处理内核。${PLAIN}"
+                    exit 0
+                fi
+
+                do_kernel="n"
+                if ! kernel_ok; then
+                    echo -e "${RED}内核缺失或损坏，将强制覆盖安装 v${NEW_K}。${PLAIN}"
+                    do_kernel="y"
+                elif [ "$CUR_K" != "$NEW_K" ]; then
+                    read -p "发现新内核 v${NEW_K}，是否一并覆盖更新？(y/n) [默认: y]: " ans
+                    [[ "${ans:-y}" == "y" || "${ans:-y}" == "Y" ]] && do_kernel="y"
+                else
+                    read -p "内核已是最新 v${CUR_K}，是否仍强制覆盖重装？(y/n) [默认: n]: " ans
+                    [[ "${ans:-n}" == "y" || "${ans:-n}" == "Y" ]] && do_kernel="y"
+                fi
+
+                if [ "$do_kernel" == "y" ]; then
+                    if [ -f "$CONFIG_FILE" ]; then
+                        install_kernel "$NEW_K" restart
+                    else
+                        install_kernel "$NEW_K" norestart
+                    fi
+                fi
+
+                echo -e "\n${GREEN}处理完毕！请执行 sb 命令进入面板。${PLAIN}"
+                exit 0
                 ;;
             2) uninstall_all; exit 0 ;;
             3) ;;
