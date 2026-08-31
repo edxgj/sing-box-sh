@@ -43,10 +43,23 @@ GLOBAL_IP=""
 GLOBAL_LATEST_VER=""
 KERNEL_REINSTALLED=0
 
+ask() {
+    local __prompt="$1"
+    local __var="$2"
+    local __val
+    if ! IFS= read -r -p "$__prompt" __val; then
+        echo -e "\n${RED}输入流已结束(检测到 EOF)，无法继续交互。${PLAIN}" >&2
+        echo -e "${YELLOW}如果您是用管道方式运行(例如 curl ... | bash)，请改为:${PLAIN}" >&2
+        echo -e "${YELLOW}  先下载再执行，或执行 sb 命令进入面板。${PLAIN}" >&2
+        exit 1
+    fi
+    printf -v "$__var" '%s' "$__val"
+}
+
 pause() {
     while read -r -t 0.1; do :; done
     echo ""
-    read -r -p "按回车键继续..."
+    ask "按回车键继续..." _PAUSE_DUMMY
 }
 
 get_ip() {
@@ -229,7 +242,10 @@ fetch_script() {
     local t
     t=$(mktemp /usr/local/bin/.sb.XXXXXX) || return 1
     if fetch_url "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" "$t" \
-       && [ -s "$t" ] && head -n 1 "$t" | grep -q '^#!/bin/bash'; then
+       && [ -s "$t" ] \
+       && head -n 1 "$t" | grep -q '^#!/bin/bash' \
+       && tail -n 5 "$t" | grep -q '^menu$' \
+       && bash -n "$t" 2>/dev/null; then
         chmod 755 "$t"
         mv -f "$t" /usr/local/bin/sb
         return 0
@@ -508,7 +524,7 @@ init_base() {
 
         if [ -z "$VERSION" ]; then
             echo -e "${YELLOW}获取版本信息失败！${PLAIN}"
-            read -p "请手动输入要安装的 sing-box 版本号 (例如 1.10.1): " VERSION
+            ask "请手动输入要安装的 sing-box 版本号 (例如 1.10.1): " VERSION
             if [ -z "$VERSION" ]; then
                 echo -e "${RED}未输入版本号，安装终止。${PLAIN}"
                 return 1
@@ -525,7 +541,7 @@ init_base() {
     if [ -f "$CONFIG_FILE" ]; then
         if ! jq -e '.inbounds | type == "array"' "$CONFIG_FILE" >/dev/null 2>&1; then
             echo -e "${RED}检测到 $CONFIG_FILE 已损坏（非法 JSON 或缺少 inbounds 数组）！${PLAIN}"
-            read -p "是否重建为空白配置？原文件会被备份，但现有节点将丢失。(y/n) [默认: n]: " rebuild
+            ask "是否重建为空白配置？原文件会被备份，但现有节点将丢失。(y/n) [默认: n]: " rebuild
             if [[ "${rebuild:-n}" != "y" && "${rebuild:-n}" != "Y" ]]; then
                 echo -e "${YELLOW}已取消，未做任何修改。请手动修复该文件后再运行本脚本。${PLAIN}"
                 return 1
@@ -640,7 +656,7 @@ get_domain() {
     
     local val
     while true; do
-        read -p "$prompt [默认: $default]: " val >&2
+        ask "$prompt [默认: $default]: " val
         val=${val:-$default}
         if [[ "$val" =~ $pattern ]] && [[ "$val" =~ [a-zA-Z0-9] ]]; then
             break
@@ -679,7 +695,7 @@ apply_real_cert() {
             if [ -n "$left_days" ] && [ "$left_days" -gt 7 ]; then
                 echo -e "\n${GREEN}检测到 ${NEW_DOMAIN} 已有有效证书，剩余 ${left_days} 天。${PLAIN}"
                 echo -e "${YELLOW}Let's Encrypt 对同一域名限制 168 小时内最多签发 5 次，建议直接复用。${PLAIN}"
-                read -p "是否复用现有证书？(y/n) [默认: y]: " ru
+                ask "是否复用现有证书？(y/n) [默认: y]: " ru
                 [[ "${ru:-y}" == "y" || "${ru:-y}" == "Y" ]] && reuse=1
             fi
         fi
@@ -691,7 +707,7 @@ apply_real_cert() {
     echo -e " 2) Cloudflare DNS API - 推荐，适合各类环境"
     local v_mode
     while true; do
-        read -p "请选择 [1-2]: " v_mode
+        ask "请选择 [1-2]: " v_mode
         if [[ "$v_mode" == "1" || "$v_mode" == "2" ]]; then break; fi
     done
 
@@ -723,14 +739,14 @@ apply_real_cert() {
     else
         local NEW_CF_Key=""
         while true; do
-            read -p "请输入 Cloudflare Global API Key: " NEW_CF_Key >&2
+            ask "请输入 Cloudflare Global API Key: " NEW_CF_Key
             if [[ "$NEW_CF_Key" =~ ^[A-Za-z0-9]+$ ]]; then break; fi
             echo -e "${RED}错误：API Key 格式不正确！${PLAIN}" >&2
         done
         
         local NEW_CF_Email=""
         while true; do
-            read -p "请输入 Cloudflare 邮箱: " NEW_CF_Email >&2
+            ask "请输入 Cloudflare 邮箱: " NEW_CF_Email
             if [[ "$NEW_CF_Email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then break; fi
             echo -e "${RED}错误：邮箱格式不正确，请重新输入！${PLAIN}" >&2
         done
@@ -800,7 +816,7 @@ cert_manage() {
         echo -e " 0) 返回\n"
         
         load_secrets
-        read -p "请选择 [0-3]: " cert_idx
+        ask "请选择 [0-3]: " cert_idx
         case "$cert_idx" in
             1) apply_real_cert; pause ;;
             2) generate_self_cert; pause ;;
@@ -839,7 +855,7 @@ prompt_cert_type() {
     echo -e " 2) 自签证书"
     local c_idx
     while true; do
-        read -p "请选择 [1-2]: " c_idx
+        ask "请选择 [1-2]: " c_idx
         case "$c_idx" in
             1)
                 if [ ! -s "$CERT_DIR/real.cer" ] || [ ! -s "$CERT_DIR/real.key" ]; then
@@ -866,7 +882,7 @@ prompt_cert_type() {
 get_uuid() {
     local val
     while true; do
-        read -p "请输入UUID [默认随机]: " val >&2
+        ask "请输入UUID [默认随机]: " val
         val=${val:-$(/usr/local/bin/sing-box generate uuid)}
         if [[ "$val" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
             break
@@ -881,7 +897,7 @@ get_uuid() {
 get_pass() {
     local val
     while true; do
-        read -p "请输入密码(支持特殊符号,会自动安全编码) [默认随机]: " val >&2
+        ask "请输入密码(支持特殊符号,会自动安全编码) [默认随机]: " val
         val=${val:-$(/usr/local/bin/sing-box generate rand --hex 16)}
         if [[ "$val" =~ [^[:space:]] ]]; then
             break
@@ -1100,7 +1116,7 @@ select_inbound() {
     echo -e " 0) 返回\n"
     
     while true; do
-        read -p "请选择 [0-${#TAGS[@]}]: " idx
+        ask "请选择 [0-${#TAGS[@]}]: " idx
         if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return 1; fi
         if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -gt "${#TAGS[@]}" ]; then 
             echo -e "${RED}输入错误，请重新选择！${PLAIN}"
@@ -1156,7 +1172,7 @@ add_config() {
         
         local proto_idx
         while true; do
-            read -p "请选择 [0-5]: " proto_idx
+            ask "请选择 [0-5]: " proto_idx
             if [[ "$proto_idx" =~ ^[0-5]$ ]]; then break; fi
             echo -e "${RED}输入错误，请重新选择！${PLAIN}"
         done
@@ -1172,7 +1188,7 @@ add_config() {
         fi
 
         while true; do
-            read -p "请输入监听端口 [默认: $DEF_PORT]: " PORT
+            ask "请输入监听端口 [默认: $DEF_PORT]: " PORT
             PORT=${PORT:-$DEF_PORT}
             if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
                 echo -e "${RED}端口必须为 1-65535 之间的数字${PLAIN}"; continue
@@ -1201,7 +1217,7 @@ add_config() {
         
         local input_tag
         while true; do
-            read -p "请输入节点名称 [默认: $DEF_TAG]: " input_tag
+            ask "请输入节点名称 [默认: $DEF_TAG]: " input_tag
             input_tag=${input_tag:-$DEF_TAG}
             input_tag=${input_tag// /-}
             if [[ "$input_tag" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -1259,7 +1275,7 @@ add_config() {
                 
                 local ARGO_TOKEN=""
                 while true; do
-                    read -p "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN >&2
+                    ask "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN
                     if [[ "$ARGO_TOKEN" =~ ^[A-Za-z0-9+/=._-]+$ ]]; then break; fi
                     echo -e "${RED}错误：Token 格式不正确或为空！${PLAIN}" >&2
                 done
@@ -1358,7 +1374,7 @@ EOF
         
         if [ -n "$f_proto" ]; then
             echo ""
-            read -p "是否自动放行端口？(y/n) [默认: y]: " auto_fw
+            ask "是否自动放行端口？(y/n) [默认: y]: " auto_fw
             if [[ "${auto_fw:-y}" == "y" || "${auto_fw:-y}" == "Y" ]]; then
                 open_fw_port "$PORT" "$f_proto"
             fi
@@ -1402,7 +1418,7 @@ modify_config() {
                 
                 while true; do
                     if [ "$IS_REALITY" -eq 1 ] || [ "$IS_ARGO" -eq 1 ]; then
-                        read -p "请选择 [0-4]: " mod_idx
+                        ask "请选择 [0-4]: " mod_idx
                         case "$mod_idx" in 
                             1) action="uuid"; break ;; 
                             2) action="port"; break ;; 
@@ -1412,7 +1428,7 @@ modify_config() {
                             *) echo -e "${RED}错误!${PLAIN}" ;; 
                         esac
                     else
-                        read -p "请选择 [0-3]: " mod_idx
+                        ask "请选择 [0-3]: " mod_idx
                         case "$mod_idx" in 
                             1) action="uuid"; break ;; 
                             2) action="port"; break ;; 
@@ -1429,7 +1445,7 @@ modify_config() {
                 echo -e " 4) 更改证书类型 (域名/自签)"
                 echo -e " 0) 返回\n"
                 while true; do
-                    read -p "请选择 [0-4]: " mod_idx
+                    ask "请选择 [0-4]: " mod_idx
                     case "$mod_idx" in 
                         1) action="pass"; break ;; 
                         2) action="port"; break ;; 
@@ -1514,7 +1530,7 @@ modify_config() {
                     echo -e "${YELLOW}改完本地端口后，必须去 Cloudflare Zero Trust 后台把该 Tunnel 的${PLAIN}"
                     echo -e "${YELLOW}Public Hostname (Ingress) 目标同步改成 localhost:<新端口>，${PLAIN}"
                     echo -e "${YELLOW}否则节点会立即失效(隧道返回 502)。${PLAIN}"
-                    read -p "确认继续修改端口？(y/n) [默认: n]: " argo_go
+                    ask "确认继续修改端口？(y/n) [默认: n]: " argo_go
                     if [[ "${argo_go:-n}" != "y" && "${argo_go:-n}" != "Y" ]]; then
                         echo -e "${CYAN}已取消。${PLAIN}"
                         pause
@@ -1524,7 +1540,7 @@ modify_config() {
 
                 local NEW_PORT
                 while true; do
-                    read -p "请输入新端口 [默认随机]: " NEW_PORT
+                    ask "请输入新端口 [默认随机]: " NEW_PORT
                     NEW_PORT=${NEW_PORT:-$(rand_port)}
                     if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then echo -e "${RED}错误输入!${PLAIN}"; continue; fi
                     if [ "$NEW_PORT" != "$OLD_PORT" ] && check_port "$NEW_PORT" "$f_proto"; then echo -e "${RED}端口占用!${PLAIN}"; continue; fi
@@ -1575,7 +1591,7 @@ modify_config() {
                     if [ -n "$f_proto" ]; then
                         close_fw_port "$OLD_PORT" "$f_proto"
                         sed -i "\\|^${OLD_PORT}/${f_proto}\$|d" "$FW_PORTS_FILE" 2>/dev/null
-                        read -p "是否自动放行新端口？(y/n) [默认: y]: " auto_fw
+                        ask "是否自动放行新端口？(y/n) [默认: y]: " auto_fw
                         if [[ "${auto_fw:-y}" == "y" || "${auto_fw:-y}" == "Y" ]]; then open_fw_port "$NEW_PORT" "$f_proto"; fi
                     fi
                     
@@ -1588,7 +1604,7 @@ modify_config() {
             elif [ "$action" == "tag" ]; then
                 local NEW_TAG=""
                 while true; do
-                    read -p "请输入新的节点名称: " NEW_TAG
+                    ask "请输入新的节点名称: " NEW_TAG
                     NEW_TAG=${NEW_TAG// /-}
                     if [ -z "$NEW_TAG" ]; then echo -e "${RED}不能为空!${PLAIN}"; continue; fi
                     if ! [[ "$NEW_TAG" =~ ^[a-zA-Z0-9_-]+$ ]]; then echo -e "${RED}错误：节点名称仅限字母、数字、短横线和下划线！${PLAIN}"; continue; fi
@@ -1758,7 +1774,7 @@ view_config() {
         echo -e " 2) 聚合链接"
         echo -e " 0) 返回\n"
         while true; do
-            read -p "请选择 [0-2]: " v_idx
+            ask "请选择 [0-2]: " v_idx
             case "$v_idx" in 1) view_single_config; break ;; 2) show_all_links; break ;; 0) return ;; *) echo -e "${RED}输入错误!${PLAIN}" ;; esac
         done
     done
@@ -1773,7 +1789,7 @@ run_manage() {
         echo -e " 3) 重启"
         echo -e " 0) 返回\n"
         while true; do
-            read -p "请选择 [0-3]: " run_idx
+            ask "请选择 [0-3]: " run_idx
             case "$run_idx" in
                 1|3) 
                    local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE 2>/dev/null)
@@ -1820,7 +1836,7 @@ update_manage() {
         echo -e " 3) 强制覆盖重装内核"
         echo -e " 0) 返回\n"
         while true; do
-            read -p "请选择 [0-3]: " up_idx
+            ask "请选择 [0-3]: " up_idx
             case "$up_idx" in
                 1)
                     if [ -z "$NEW_VER" ]; then echo -e "${RED}获取最新版本失败！API 受限或网络超时。${PLAIN}"; pause; break; fi
@@ -1840,11 +1856,11 @@ update_manage() {
                     ;;
                 3)
                     if [ -z "$NEW_VER" ]; then
-                        read -p "获取最新版本失败，请手动输入要安装的版本号 (如 1.10.1): " NEW_VER
+                        ask "获取最新版本失败，请手动输入要安装的版本号 (如 1.10.1): " NEW_VER
                         [ -z "$NEW_VER" ] && { echo -e "${RED}未输入版本号，已取消。${PLAIN}"; pause; break; }
                     fi
                     echo -e "\n${YELLOW}将强制覆盖安装 v${NEW_VER}（无论当前版本是否相同）。${PLAIN}"
-                    read -p "确认继续？(y/n) [默认: y]: " fc
+                    ask "确认继续？(y/n) [默认: y]: " fc
                     if [[ "${fc:-y}" == "y" || "${fc:-y}" == "Y" ]]; then
                         install_kernel "$NEW_VER" restart
                     else
@@ -1911,7 +1927,7 @@ config_outbound() {
         echo -e " 2) 仅 IPv6 出站 (ipv6_only)"
         echo -e " 3) 自动/双栈出站 (auto)"
         echo -e " 0) 返回\n"
-        read -p "请选择 [0-3]: " out_idx
+        ask "请选择 [0-3]: " out_idx
         
         local USE_NEW_FORMAT=0
         if ! kernel_ok || sb_ge_112; then
@@ -1964,7 +1980,7 @@ other_manage() {
         echo -e " 1) 开启 BBR 加速"
         echo -e " 2) 配置出站 IPv4/IPv6"
         echo -e " 0) 返回\n"
-        read -p "请选择 [0-2]: " om_idx
+        ask "请选择 [0-2]: " om_idx
         case "$om_idx" in
             1) enable_bbr ;;
             2) config_outbound ;;
@@ -1975,7 +1991,7 @@ other_manage() {
 }
 
 uninstall_all() {
-    read -p "确认卸载脚本、sing-box和所有节点配置吗？(y/n): " un
+    ask "确认卸载脚本、sing-box和所有节点配置吗？(y/n): " un
     if [[ "$un" == "y" ]]; then
         remove_all_fw_rules
         if [ "$OS_TYPE" == "alpine" ]; then
@@ -2065,7 +2081,7 @@ menu() {
         echo -e " 8) 其他"
         echo -e " 9) 卸载"
         echo -e " 0) 退出\n"
-        read -p "请选择 [0-9]: " choice
+        ask "请选择 [0-9]: " choice
 
         case "$choice" in
             1) add_config ;;
@@ -2091,7 +2107,7 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
         echo -e " 2. 卸载脚本 + 内核"
         echo -e " 3. 进入面板"
         echo -e " 4. 退出\n"
-        read -p "请选择 [1-4]: " pre_choice
+        ask "请选择 [1-4]: " pre_choice
         case "$pre_choice" in
             1)
                 echo -e "${CYAN}正在拉取最新脚本代码...${PLAIN}"
@@ -2119,10 +2135,10 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
                     echo -e "${RED}内核缺失或损坏，将强制覆盖安装 v${NEW_K}。${PLAIN}"
                     do_kernel="y"
                 elif [ "$CUR_K" != "$NEW_K" ]; then
-                    read -p "发现新内核 v${NEW_K}，是否一并覆盖更新？(y/n) [默认: y]: " ans
+                    ask "发现新内核 v${NEW_K}，是否一并覆盖更新？(y/n) [默认: y]: " ans
                     [[ "${ans:-y}" == "y" || "${ans:-y}" == "Y" ]] && do_kernel="y"
                 else
-                    read -p "内核已是最新 v${CUR_K}，是否仍强制覆盖重装？(y/n) [默认: n]: " ans
+                    ask "内核已是最新 v${CUR_K}，是否仍强制覆盖重装？(y/n) [默认: n]: " ans
                     [[ "${ans:-n}" == "y" || "${ans:-n}" == "Y" ]] && do_kernel="y"
                 fi
 
