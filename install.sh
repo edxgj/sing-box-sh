@@ -41,6 +41,7 @@ fi
 
 GLOBAL_IP=""
 GLOBAL_LATEST_VER=""
+KERNEL_REINSTALLED=0
 
 pause() {
     while read -r -t 0.1; do :; done
@@ -50,15 +51,34 @@ pause() {
 
 get_ip() {
     if [ -z "$GLOBAL_IP" ]; then
+        mkdir -p "$CONFIG_DIR" 2>/dev/null
+        local IP_CACHE="$CONFIG_DIR/.ip_cache"
+        local IP_TTL=300
+        if [ -f "$IP_CACHE" ]; then
+            local c_time c_ip
+            c_time=$(head -n 1 "$IP_CACHE" 2>/dev/null)
+            c_ip=$(tail -n 1 "$IP_CACHE" 2>/dev/null)
+            if [[ "$c_time" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - c_time )) -le $IP_TTL ] && [ -n "$c_ip" ]; then
+                GLOBAL_IP="$c_ip"
+                echo "$GLOBAL_IP"
+                return
+            fi
+        fi
+
         local ip
-        ip=$(curl -s -m 5 https://ipv4.icanhazip.com)
+        ip=$(http_get https://ipv4.icanhazip.com)
         if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
             GLOBAL_IP="$ip"
         else
-            ip=$(curl -s -m 5 https://ipv6.icanhazip.com)
+            ip=$(http_get https://ipv6.icanhazip.com)
             if [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
                 GLOBAL_IP="$ip"
             fi
+        fi
+
+        if [ -n "$GLOBAL_IP" ]; then
+            { echo "$(date +%s)"; echo "$GLOBAL_IP"; } > "$IP_CACHE" 2>/dev/null
+            chmod 600 "$IP_CACHE" 2>/dev/null
         fi
     fi
     echo "$GLOBAL_IP"
@@ -83,8 +103,12 @@ get_latest_version() {
             fi
         fi
 
-        local res=$(curl -s -m 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [ -n "$res" ]; then
+        local res
+        res=$(http_get "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
+              | grep '"tag_name":' \
+              | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+              | head -n 1)
+        if [[ "$res" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             GLOBAL_LATEST_VER=${res#v}
             echo "$NOW" > "$CACHE_FILE"
             echo "$GLOBAL_LATEST_VER" >> "$CACHE_FILE"
@@ -100,7 +124,8 @@ JQ_DNS_LOCAL='.dns.servers |= (. // []) |
   else . end'
 
 sb_ge_112() {
-    local ver=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    local ver
+    ver=$( ( /usr/local/bin/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     [ -z "$ver" ] && return 1
     local major=$(echo "$ver" | cut -d. -f1)
     local minor=$(echo "$ver" | cut -d. -f2)
@@ -189,9 +214,21 @@ apply_jq_config() {
     fi
 }
 
+http_get() {
+    local url="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -sL -m 10 "$url" 2>/dev/null && return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -T 10 -qO - "$url" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
 fetch_script() {
-    local t=$(mktemp /usr/local/bin/.sb.XXXXXX) || return 1
-    if curl -sL "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" -o "$t" \
+    local t
+    t=$(mktemp /usr/local/bin/.sb.XXXXXX) || return 1
+    if fetch_url "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" "$t" \
        && [ -s "$t" ] && head -n 1 "$t" | grep -q '^#!/bin/bash'; then
         chmod 755 "$t"
         mv -f "$t" /usr/local/bin/sb
@@ -199,6 +236,16 @@ fetch_script() {
     fi
     rm -f "$t"
     return 1
+}
+
+cleanup_node_secrets() {
+    local port="$1" type="$2" is_argo="${3:-0}"
+    if [ "$is_argo" -eq 1 ]; then
+        remove_secret "ARGO_IP_${port}"
+        remove_secret "ARGO_DOMAIN_${port}"
+    elif [ "$type" == "vless" ]; then
+        remove_secret "REALITY_PUB_${port}"
+    fi
 }
 
 open_fw_port() {
@@ -303,21 +350,16 @@ migrate_certs() {
 
 kernel_ok() {
     [ -x /usr/local/bin/sing-box ] || return 1
-    # 用命令替换+子shell调用，避免内核已损坏时 shell 作业控制把
-    # "Bus error/Segmentation fault" 直接打到终端造成误导性噪音。
     local ver
     ver=$( ( /usr/local/bin/sing-box version ) 2>/dev/null ) || return 1
     echo "$ver" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' || return 1
     return 0
 }
 
-# fetch_url <url> <输出路径>
-# 兼容 GNU wget / BusyBox wget(Alpine) / curl，避免 --show-progress 在 BusyBox 上报错。
 fetch_url() {
     local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
         curl -fL --retry 2 --connect-timeout 15 -o "$out" "$url" && return 0
-        return 1
     fi
     if command -v wget >/dev/null 2>&1; then
         if wget --help 2>&1 | grep -q -- '--show-progress'; then
@@ -329,8 +371,6 @@ fetch_url() {
     return 1
 }
 
-# install_kernel <版本号> [restart|norestart]
-# 下载指定版本内核并覆盖安装。restart 模式下会重启服务，启动失败自动回滚旧内核。
 install_kernel() {
     local ver="$1"
     local mode="${2:-restart}"
@@ -363,6 +403,18 @@ install_kernel() {
         rm -rf "$tmp"; return 1
     fi
     chmod +x /usr/local/bin/sing-box
+    chown 0:0 /usr/local/bin/sing-box 2>/dev/null
+
+    if ! kernel_ok; then
+        echo -e "${RED}新内核 v${ver} 无法执行(可能缺少运行库或架构不匹配)。${PLAIN}"
+        if [ -s "$tmp/sing-box.old" ]; then
+            mv -f "$tmp/sing-box.old" /usr/local/bin/sing-box
+            chmod +x /usr/local/bin/sing-box
+            chown 0:0 /usr/local/bin/sing-box 2>/dev/null
+            echo -e "${YELLOW}已回滚到原内核。${PLAIN}"
+        fi
+        rm -rf "$tmp"; return 1
+    fi
 
     if [ "$mode" == "norestart" ]; then
         echo -e "${GREEN}==> 内核 v${ver} 安装完毕！${PLAIN}"
@@ -370,7 +422,6 @@ install_kernel() {
     fi
 
     if restart_service; then
-        GLOBAL_LATEST_VER="$ver"
         echo -e "${GREEN}==> 内核已覆盖为 v${ver}，服务运行正常。${PLAIN}"
         rm -rf "$tmp"; return 0
     fi
@@ -388,43 +439,84 @@ install_kernel() {
     return 1
 }
 
-init_base() {
-    if ! command -v jq &> /dev/null || ! kernel_ok; then
-        echo -e "${CYAN}==> 正在准备环境与内核...${PLAIN}"
-        if [ "$OS_TYPE" == "alpine" ]; then
-            apk update >/dev/null 2>&1
-            apk add curl wget jq tar openssl socat bash nano libc6-compat gcompat >/dev/null 2>&1
-            rc-update add crond default >/dev/null 2>&1
-            rc-service crond start >/dev/null 2>&1
-        elif [ "$OS_TYPE" == "centos" ]; then
-            if command -v dnf >/dev/null 2>&1; then
-                dnf install -y epel-release >/dev/null 2>&1
-                dnf update -y >/dev/null 2>&1
-                dnf install -y curl wget jq tar openssl socat cronie systemd nano >/dev/null 2>&1
-            else
-                yum install -y epel-release >/dev/null 2>&1
-                yum update -y >/dev/null 2>&1
-                yum install -y curl wget jq tar openssl socat cronie systemd nano >/dev/null 2>&1
-            fi
-            systemctl enable crond --now >/dev/null 2>&1
+ensure_deps() {
+    local miss=()
+    local c
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || miss+=("$c")
+    done
+    [ ${#miss[@]} -eq 0 ] && return 0
+
+    echo -e "${CYAN}==> 缺少依赖: ${miss[*]}，正在自动安装...${PLAIN}"
+    local pkgs=()
+    for c in "${miss[@]}"; do
+        case "$c" in
+            crontab) [ "$OS_TYPE" == "alpine" ] && pkgs+=(dcron) || { [ "$OS_TYPE" == "centos" ] && pkgs+=(cronie) || pkgs+=(cron); } ;;
+            ss)      pkgs+=(iproute2) ;;
+            *)       pkgs+=("$c") ;;
+        esac
+    done
+
+    if [ "$OS_TYPE" == "alpine" ]; then
+        apk update >/dev/null 2>&1
+        apk add "${pkgs[@]}" >/dev/null 2>&1
+    elif [ "$OS_TYPE" == "centos" ]; then
+        if command -v dnf >/dev/null 2>&1; then
+            dnf install -y epel-release >/dev/null 2>&1
+            dnf install -y "${pkgs[@]}" >/dev/null 2>&1
         else
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y curl wget jq tar openssl socat cron systemd nano >/dev/null 2>&1
+            yum install -y epel-release >/dev/null 2>&1
+            yum install -y "${pkgs[@]}" >/dev/null 2>&1
         fi
-        
+    else
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y "${pkgs[@]}" >/dev/null 2>&1
+    fi
+
+    local still=()
+    for c in "${miss[@]}"; do
+        command -v "$c" >/dev/null 2>&1 || still+=("$c")
+    done
+    if [ ${#still[@]} -gt 0 ]; then
+        echo -e "${RED}以下依赖安装失败: ${still[*]}${PLAIN}"
+        echo -e "${YELLOW}请手动安装后重试。${PLAIN}"
+        return 1
+    fi
+    echo -e "${GREEN}==> 依赖安装完毕。${PLAIN}"
+    return 0
+}
+
+init_base() {
+    ensure_deps curl wget jq tar openssl socat ss crontab || return 1
+
+    if [ "$OS_TYPE" == "alpine" ]; then
+        if [ ! -e /lib/ld-linux-x86-64.so.2 ] && [ ! -e /lib64/ld-linux-x86-64.so.2 ] \
+           && [ ! -e /lib/ld-linux-aarch64.so.1 ] && [ ! -e /lib64/ld-linux-aarch64.so.1 ]; then
+            echo -e "${CYAN}==> 正在安装 glibc 兼容层(sing-box 官方二进制需要)...${PLAIN}"
+            apk add libc6-compat gcompat >/dev/null 2>&1
+        fi
+        rc-update add crond default >/dev/null 2>&1
+        rc-service crond start >/dev/null 2>&1
+    elif [ "$OS_TYPE" == "centos" ]; then
+        systemctl enable crond --now >/dev/null 2>&1
+    fi
+
+    if ! kernel_ok; then
         echo -e "${CYAN}==> 正在获取最新版 sing-box 内核信息...${PLAIN}"
-        local VERSION=$(get_latest_version)
-        
+        local VERSION
+        VERSION=$(get_latest_version)
+
         if [ -z "$VERSION" ]; then
             echo -e "${YELLOW}获取版本信息失败！${PLAIN}"
             read -p "请手动输入要安装的 sing-box 版本号 (例如 1.10.1): " VERSION
             if [ -z "$VERSION" ]; then
                 echo -e "${RED}未输入版本号，安装终止。${PLAIN}"
-                exit 1
+                return 1
             fi
         fi
         echo -e "${CYAN}==> 开始下载 v${VERSION} 内核...${PLAIN}"
-        install_kernel "$VERSION" norestart || exit 1
+        install_kernel "$VERSION" norestart || return 1
+        KERNEL_REINSTALLED=1
     fi
 
 
@@ -473,6 +565,20 @@ init_base() {
         fi
     fi
     migrate_certs
+
+    if [ "${KERNEL_REINSTALLED:-0}" -eq 1 ]; then
+        local n
+        n=$(jq '.inbounds | length' "$CONFIG_FILE" 2>/dev/null)
+        if [ -n "$n" ] && [ "$n" -gt 0 ]; then
+            echo -e "${CYAN}==> 检测到已有节点，正在用新内核重启服务...${PLAIN}"
+            if restart_service; then
+                echo -e "${GREEN}==> 服务已恢复运行。${PLAIN}"
+            else
+                echo -e "${RED}==> 服务启动失败！请用 [6) 运行管理] 查看，或执行:${PLAIN}"
+                echo -e "${YELLOW}    sing-box check -c ${CONFIG_FILE}${PLAIN}"
+            fi
+        fi
+    fi
 }
 
 restart_service() {
@@ -563,7 +669,6 @@ apply_real_cert() {
                 [ -s "$c" ] && { exist_cer="$c"; break; }
             done
         fi
-        # 该域名在 acme.sh 里已有记录，说明证书不是本脚本创建的，卸载时不得删除
         [ -n "$exist_cer" ] && had_prior=1
         if [ -n "$exist_cer" ]; then
             local left_days=""
@@ -591,7 +696,15 @@ apply_real_cert() {
     done
 
     if [ ! -f ~/.acme.sh/acme.sh ]; then
-        curl -sL https://get.acme.sh | sh
+        if command -v curl >/dev/null 2>&1; then
+            curl -sL https://get.acme.sh | sh
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO - https://get.acme.sh | sh
+        fi
+        if [ ! -f ~/.acme.sh/acme.sh ]; then
+            echo -e "${RED}acme.sh 安装失败！请检查网络后重试。${PLAIN}"
+            return 1
+        fi
     fi
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
 
@@ -648,7 +761,6 @@ apply_real_cert() {
     chmod 644 $CERT_DIR/*.cer 2>/dev/null
     chmod 600 $CERT_DIR/*.key 2>/dev/null
     save_secret "REAL_DOMAIN" "$NEW_DOMAIN"
-    # 记录该证书是否为脚本自己申请：复用/已有记录的证书属于用户，卸载时不得 acme --remove
     if [ "$had_prior" -eq 1 ]; then
         save_secret "REAL_CERT_OWNED" "0"
     else
@@ -659,14 +771,7 @@ apply_real_cert() {
 }
 
 generate_self_cert() {
-    if ! command -v openssl >/dev/null 2>&1; then
-        echo -e "${RED}系统缺少 openssl，正在尝试安装...${PLAIN}"
-        if [ "$OS_TYPE" == "alpine" ]; then apk add openssl; elif [ "$OS_TYPE" == "centos" ]; then yum install -y openssl || dnf install -y openssl; else apt-get install -y openssl; fi
-        if ! command -v openssl >/dev/null 2>&1; then
-            echo -e "${RED}openssl 自动安装失败，请手动安装后重试！${PLAIN}"
-            return 1
-        fi
-    fi
+    ensure_deps openssl || return 1
 
     local NEW_DOMAIN=$(get_domain "请输入伪装域名" "bing.com")
     
@@ -1219,11 +1324,12 @@ EOF
                 ;;
         esac
         
+        local NODE_SEC_TYPE=""
+        [ "$proto_idx" == "1" ] && NODE_SEC_TYPE="vless"
+
         if [ "$jq_ok" -eq 0 ]; then
             mv ${CONFIG_FILE}.bak $CONFIG_FILE
-            remove_secret "REALITY_PUB_${PORT}"
-            remove_secret "ARGO_IP_${PORT}"
-            remove_secret "ARGO_DOMAIN_${PORT}"
+            cleanup_node_secrets "$PORT" "$NODE_SEC_TYPE" "$IS_ARGO"
             pause
             continue
         fi
@@ -1231,9 +1337,7 @@ EOF
         if ! restart_service; then
             echo -e "${RED}节点添加失败(校验报错)，已为您还原配置！${PLAIN}"
             mv ${CONFIG_FILE}.bak $CONFIG_FILE
-            remove_secret "REALITY_PUB_${PORT}"
-            remove_secret "ARGO_IP_${PORT}"
-            remove_secret "ARGO_DOMAIN_${PORT}"
+            cleanup_node_secrets "$PORT" "$NODE_SEC_TYPE" "$IS_ARGO"
             if [ "$IS_ARGO" -eq 1 ]; then
                 if [ "$OS_TYPE" == "alpine" ]; then
                     rc-service "cloudflared-${TAG}" stop >/dev/null 2>&1
@@ -1435,7 +1539,9 @@ modify_config() {
                 fi
                 
                 load_secrets
+                local IS_REALITY_NODE=0
                 if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tls.reality.enabled' $CONFIG_FILE >/dev/null 2>&1; then
+                    IS_REALITY_NODE=1
                     local var_pub="REALITY_PUB_${OLD_PORT}"
                     local PUB="${!var_pub}"
                     [ -n "$PUB" ] && save_secret "REALITY_PUB_${NEW_PORT}" "$PUB"
@@ -1448,20 +1554,19 @@ modify_config() {
                     [ -n "$A_IP" ] && save_secret "ARGO_IP_${NEW_PORT}" "$A_IP"
                     [ -n "$A_DOM" ] && save_secret "ARGO_DOMAIN_${NEW_PORT}" "$A_DOM"
                 fi
-                
+
+                local SEC_TYPE=""
+                [ "$IS_REALITY_NODE" -eq 1 ] && SEC_TYPE="vless"
+
                 if ! restart_service; then 
                     echo -e "${RED}操作失败，已还原配置！${PLAIN}"
                     mv ${CONFIG_FILE}.bak $CONFIG_FILE
                     if [ "$OLD_PORT" != "$NEW_PORT" ]; then
-                        remove_secret "REALITY_PUB_${NEW_PORT}"
-                        remove_secret "ARGO_IP_${NEW_PORT}"
-                        remove_secret "ARGO_DOMAIN_${NEW_PORT}"
+                        cleanup_node_secrets "$NEW_PORT" "$SEC_TYPE" "$IS_ARGO"
                     fi
                 else
                     if [ "$OLD_PORT" != "$NEW_PORT" ]; then
-                        remove_secret "REALITY_PUB_${OLD_PORT}"
-                        remove_secret "ARGO_IP_${OLD_PORT}"
-                        remove_secret "ARGO_DOMAIN_${OLD_PORT}"
+                        cleanup_node_secrets "$OLD_PORT" "$SEC_TYPE" "$IS_ARGO"
                     fi
                     rm -f ${CONFIG_FILE}.bak
                     
@@ -1603,9 +1708,7 @@ del_config() {
             fi
         fi
         
-        remove_secret "REALITY_PUB_${PORT}"
-        remove_secret "ARGO_IP_${PORT}"
-        remove_secret "ARGO_DOMAIN_${PORT}"
+        cleanup_node_secrets "$PORT" "$TYPE" "$IS_ARGO"
         
         local INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
         if [ "$INBOUND_COUNT" -eq 0 ]; then
@@ -1697,8 +1800,9 @@ update_manage() {
         clear
         echo -e "${CYAN}正在检查更新，请稍候...${PLAIN}"
         local CUR_VER="未安装"
-        if [ -f "/usr/local/bin/sing-box" ]; then
-            local extracted_ver=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        if kernel_ok; then
+            local extracted_ver
+            extracted_ver=$( ( /usr/local/bin/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
             [ -n "$extracted_ver" ] && CUR_VER="$extracted_ver"
         fi
         local NEW_VER=$(get_latest_version)
@@ -1765,6 +1869,18 @@ enable_bbr() {
 
     modprobe tcp_bbr 2>/dev/null
 
+    if [ -f /etc/sysctl.conf ]; then
+        if grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' /etc/sysctl.conf; then
+            if [ ! -f "$CONFIG_DIR/.sysctl_backup" ]; then
+                mkdir -p "$CONFIG_DIR" 2>/dev/null
+                grep -E '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' \
+                    /etc/sysctl.conf > "$CONFIG_DIR/.sysctl_backup" 2>/dev/null
+                chmod 600 "$CONFIG_DIR/.sysctl_backup" 2>/dev/null
+                echo -e "${CYAN}已备份 /etc/sysctl.conf 中原有的 qdisc/拥塞控制设置。${PLAIN}"
+            fi
+        fi
+    fi
+
     sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null
     sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null
 
@@ -1798,7 +1914,7 @@ config_outbound() {
         read -p "请选择 [0-3]: " out_idx
         
         local USE_NEW_FORMAT=0
-        if ! /usr/local/bin/sing-box version >/dev/null 2>&1 || sb_ge_112; then
+        if ! kernel_ok || sb_ge_112; then
             USE_NEW_FORMAT=1
         fi
         
@@ -1881,8 +1997,6 @@ uninstall_all() {
         
         if [ -f "$HOME/.acme.sh/acme.sh" ]; then
             load_secrets
-            # 仅移除本脚本自己申请的证书；复用用户已有证书时 REAL_CERT_OWNED=0，
-            # 此时删除会连带删掉用户原有的自动续期记录，导致其它服务的证书到期失效。
             if [ -n "$REAL_DOMAIN" ] && [ "${REAL_CERT_OWNED:-1}" == "1" ]; then
                 $HOME/.acme.sh/acme.sh --remove -d "$REAL_DOMAIN" >/dev/null 2>&1
             elif [ -n "$REAL_DOMAIN" ]; then
@@ -1890,13 +2004,26 @@ uninstall_all() {
             fi
         fi
         
+        SYSCTL_BAK_TMP=""
+        if [ -f "$CONFIG_DIR/.sysctl_backup" ]; then
+            SYSCTL_BAK_TMP=$(mktemp) && cp -f "$CONFIG_DIR/.sysctl_backup" "$SYSCTL_BAK_TMP" 2>/dev/null
+        fi
+
         rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb /etc/sing-box
         
         if [ -f /etc/sysctl.d/99-bbr.conf ]; then
             rm -f /etc/sysctl.d/99-bbr.conf 2>/dev/null
-            sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
-            sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1
+            if [ -n "$SYSCTL_BAK_TMP" ] && [ -s "$SYSCTL_BAK_TMP" ]; then
+                sed -i '/net.core.default_qdisc/d; /net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null
+                cat "$SYSCTL_BAK_TMP" >> /etc/sysctl.conf 2>/dev/null
+                sysctl -p /etc/sysctl.conf >/dev/null 2>&1
+                echo -e "${GREEN}已还原 /etc/sysctl.conf 中原有的 qdisc/拥塞控制设置。${PLAIN}"
+            else
+                sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+                sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1
+            fi
         fi
+        [ -n "$SYSCTL_BAK_TMP" ] && rm -f "$SYSCTL_BAK_TMP"
         
         echo -e "${GREEN}已彻底卸载！系统已恢复原状。${PLAIN}"
     fi
@@ -1917,7 +2044,7 @@ menu() {
         fi
         [ "$SB_STATUS" == "active" ] && ST_COLOR=$GREEN || ST_COLOR=$RED
         
-        VER=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        VER=$( ( /usr/local/bin/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         if [ -n "$VER" ]; then
             if [ -n "$GLOBAL_LATEST_VER" ] && [ "$VER" != "$GLOBAL_LATEST_VER" ]; then VER_SHOW="${VER} ${YELLOW}[新版: ${GLOBAL_LATEST_VER}]${PLAIN}"
             else VER_SHOW="${VER}"
@@ -1976,7 +2103,7 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
 
                 CUR_K="未安装"
                 if kernel_ok; then
-                    CUR_K=$(/usr/local/bin/sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+                    CUR_K=$( ( /usr/local/bin/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
                 fi
                 NEW_K=$(get_latest_version)
                 echo -e "${CYAN}当前内核: ${CUR_K}    最新版本: ${NEW_K:-获取失败}${PLAIN}"
