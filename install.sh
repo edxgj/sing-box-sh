@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ====================================================================================================
-# sing-box 管理脚本
+# sing-box 多协议一体化管理脚本
 # 支持协议: VLESS-REALITY / Hysteria2 / TUIC / AnyTLS / VLESS-Argo / Shadowsocks
 # 支持系统: Debian 10+ / Ubuntu 18.04+ / Alpine 3.12+ / CentOS 7+ ...
 # ====================================================================================================
@@ -1163,7 +1163,7 @@ build_share_url() {
         shadowsocks)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[获取连接地址失败，无法生成 Shadowsocks 链接]${PLAIN}"; return; fi
             local SS_CRED
-            SS_CRED=$(url_encode "${SS_METHOD}:${N_PASS}")
+            SS_CRED=$(printf '%s' "${SS_METHOD}:${N_PASS}" | base64 -w0 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
             echo "ss://${SS_CRED}@${CONN_ADDR_URI}:${PORT}#${TAG}"
             ;;
     esac
