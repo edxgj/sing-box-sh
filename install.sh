@@ -1,11 +1,5 @@
 #!/bin/bash
 
-# ====================================================================================================
-# sing-box 多协议一体化管理脚本
-# 支持协议: VLESS-REALITY / Hysteria2 / TUIC / AnyTLS / VLESS-Argo / Shadowsocks
-# 支持系统: Debian 10+ / Ubuntu 18.04+ / Alpine 3.12+ / CentOS 7+ ...
-# ====================================================================================================
-
 umask 077
 
 RED='\033[0;31m'
@@ -20,7 +14,6 @@ CERT_DIR="$CONFIG_DIR/cert"
 SECRETS_FILE="$CONFIG_DIR/.secrets"
 FW_PORTS_FILE="$CONFIG_DIR/.fw_ports"
 
-# 全局中断与清理机制：保证 Ctrl+C 触发时瞬间摧毁临时文件(内核临时目录/config临时文件/脚本缓存)并立刻退出整个脚本
 KERNEL_TMP_DIR=""
 cleanup_on_exit() {
     [ -n "$KERNEL_TMP_DIR" ] && rm -rf "$KERNEL_TMP_DIR" 2>/dev/null
@@ -60,7 +53,6 @@ GLOBAL_IP=""
 GLOBAL_LATEST_VER=""
 KERNEL_REINSTALLED=0
 
-# 交互式读取一行输入(EOF 安全)，结果通过变量名写入调用方
 ask() {
     local __prompt="$1"
     local __var="$2"
@@ -74,14 +66,12 @@ ask() {
     printf -v "$__var" '%s' "$__val"
 }
 
-# 清空输入缓冲区并等待用户按回车继续
 pause() {
     while read -r -t 0.1; do :; done
     echo ""
     ask "按回车键继续..." _PAUSE_DUMMY
 }
 
-# 获取服务器公网 IP(IPv4 优先/IPv6 兜底，带 300 秒缓存)
 get_ip() {
     if [ -z "$GLOBAL_IP" ]; then
         mkdir -p "$CONFIG_DIR" 2>/dev/null
@@ -117,7 +107,6 @@ get_ip() {
     echo "$GLOBAL_IP"
 }
 
-# 获取 sing-box 最新版本号(GitHub API + 1 小时缓存)
 get_latest_version() {
     mkdir -p "$CONFIG_DIR" 2>/dev/null
     local CACHE_FILE="$CONFIG_DIR/.version_cache"
@@ -174,7 +163,6 @@ sb_ge_112() {
     return 1
 }
 
-# 检测端口是否被占用(ss/netstat 自适配，可指定 tcp/udp/both)
 check_port() {
     local port=$1
     local proto=${2:-both}
@@ -192,7 +180,6 @@ check_port() {
     fi
 }
 
-# 生成随机未占用端口(10000-64999)
 rand_port() {
     local port
     while true; do
@@ -204,7 +191,6 @@ rand_port() {
     done
 }
 
-# URL 百分号编码(jq @uri 实现，安全处理特殊符号)
 url_encode() {
     jq -rn --arg s "$1" '$s|@uri'
 }
@@ -218,7 +204,6 @@ wrap_ipv6() {
     fi
 }
 
-# 原子写入密钥到 secrets 文件(单引号包裹防注入，去重更新)
 save_secret() {
     local key=$1
     local val=$2
@@ -237,7 +222,6 @@ save_secret() {
     return 1
 }
 
-# 从 secrets 文件中删除指定前缀的密钥行
 remove_secret() {
     local key_prefix=$1
     if [ -f "$SECRETS_FILE" ]; then
@@ -253,7 +237,6 @@ remove_secret() {
     fi
 }
 
-# 加载 secrets 文件到同名环境变量(严格格式校验，忽略注释/空行)
 load_secrets() {
     [ -f "$SECRETS_FILE" ] || return 0
     local line key val
@@ -268,7 +251,6 @@ load_secrets() {
     return 0
 }
 
-# 原子应用 jq 变更到 config.json(临时文件+非空校验+mv，失败保留原配置)
 apply_jq_config() {
     local jq_filter="$1"
     shift
@@ -284,7 +266,6 @@ apply_jq_config() {
     fi
 }
 
-# HTTP GET 请求(curl 优先/wget 回退，10 秒超时)
 http_get() {
     local url="$1"
     if command -v curl >/dev/null 2>&1; then
@@ -296,7 +277,6 @@ http_get() {
     return 1
 }
 
-# 下载并多重校验(shebang/结构/语法)后安装面板脚本到 /usr/local/bin/sb
 fetch_script() {
     local t
     t=$(mktemp /usr/local/bin/.sb.XXXXXX) || return 1
@@ -325,7 +305,6 @@ cleanup_node_secrets() {
     fi
 }
 
-# 放行防火墙端口(ufw/firewalld/iptables 自适配；proto=both 时 TCP+UDP 双放行，成功记录到 FW_PORTS_FILE)
 open_fw_port() {
     local port=$1
     local proto=$2
@@ -377,7 +356,6 @@ open_fw_port() {
     fi
 }
 
-# 关闭防火墙端口(逆向 open_fw_port；proto=both 时 TCP+UDP 双关闭)
 close_fw_port() {
     local port=$1
     local proto=$2
@@ -410,7 +388,6 @@ close_fw_port() {
     fi
 }
 
-# 按 FW_PORTS_FILE 记录清空本脚本放行的全部防火墙规则(卸载用)
 remove_all_fw_rules() {
     if [ -f "$FW_PORTS_FILE" ]; then
         while IFS="/" read -r port proto; do
@@ -422,7 +399,6 @@ remove_all_fw_rules() {
     fi
 }
 
-# 旧版证书文件名迁移(fullchain.cer -> real.cer / self.cer，并同步 config 路径)
 migrate_certs() {
     load_secrets
     if [ -f "$CERT_DIR/fullchain.cer" ]; then
@@ -441,7 +417,6 @@ migrate_certs() {
     fi
 }
 
-# 校验内核二进制存在、可执行且版本号可读
 kernel_ok() {
     [ -x /usr/local/bin/sing-box ] || return 1
     local ver
@@ -450,7 +425,6 @@ kernel_ok() {
     return 0
 }
 
-# 下载文件到指定路径(curl 优先/wget 回退，带重试)
 fetch_url() {
     local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
@@ -466,7 +440,6 @@ fetch_url() {
     return 1
 }
 
-# 下载安装/覆盖 sing-box 内核(先停服务替换，失败自动回滚旧内核)
 install_kernel() {
     local ver="$1"
     local mode="${2:-restart}"
@@ -536,7 +509,6 @@ install_kernel() {
     return 1
 }
 
-# 检测缺失依赖并按发行版自动安装(apt/apk/dnf/yum)
 ensure_deps() {
     local miss=()
     local c
@@ -584,7 +556,6 @@ ensure_deps() {
     return 0
 }
 
-# 基础环境初始化(依赖/内核/glibc/配置文件修复/旧格式迁移)
 init_base() {
     ensure_deps curl wget jq tar openssl socat ss crontab || return 1
 
@@ -617,7 +588,6 @@ init_base() {
         install_kernel "$VERSION" norestart || return 1
         KERNEL_REINSTALLED=1
     fi
-
 
     mkdir -p $CONFIG_DIR $CERT_DIR || return 1
     
@@ -681,7 +651,6 @@ init_base() {
     fi
 }
 
-# 校验配置并重启 sing-box(空配置时停止服务；失败返回 1 供调用方回滚)
 restart_service() {
     local INBOUND_COUNT
     INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE 2>/dev/null)
@@ -694,7 +663,6 @@ restart_service() {
     
     if [ "$OS_TYPE" == "alpine" ]; then
         cat > /etc/init.d/sing-box << 'EOF'
-#!/sbin/openrc-run
 name="sing-box"
 command="/usr/local/bin/sing-box"
 command_args="run -c /etc/sing-box/config.json"
@@ -734,7 +702,6 @@ EOF
     return 0
 }
 
-# 交互读取合法域名(allow_colon=true 时允许 IP:端口 形式)
 get_domain() {
     local prompt="$1"
     local default="$2"
@@ -759,7 +726,6 @@ get_domain() {
     echo "$val"
 }
 
-# 通过 acme.sh 申请(或复用)Let's Encrypt 域名证书并部署到 CERT_DIR
 apply_real_cert() {
     local NEW_DOMAIN
     NEW_DOMAIN=$(get_domain "请输入解析到本机的域名" "")
@@ -879,7 +845,6 @@ apply_real_cert() {
     return 0
 }
 
-# 生成自签 ECDSA 证书(prime256v1 + SAN，兼容 anytls 严格校验)
 generate_self_cert() {
     ensure_deps openssl || return 1
 
@@ -902,7 +867,6 @@ generate_self_cert() {
     return 0
 }
 
-# 证书管理菜单(域名证书申请/自签重生成/续期状态查看)
 cert_manage() {
     while true; do
         clear
@@ -947,7 +911,6 @@ cert_manage() {
     done
 }
 
-# 交互选择节点证书类型(域名/自签)，结果写入 SEL_CERT/SEL_KEY
 prompt_cert_type() {
     echo -e "\n请选择该节点使用的证书类型:"
     echo -e " 1) 域名证书"
@@ -978,7 +941,6 @@ prompt_cert_type() {
     return 0
 }
 
-# 交互读取合法 UUID(回车默认随机生成)
 get_uuid() {
     local val
     while true; do
@@ -994,7 +956,6 @@ get_uuid() {
     echo "$val"
 }
 
-# 交互读取密码(回车默认随机 32 位 hex)
 get_pass() {
     local val
     while true; do
@@ -1009,7 +970,6 @@ get_pass() {
     echo -e "密码: ${GREEN}${val}${PLAIN}" >&2
     echo "$val"
 }
-# 交互选择 Shadowsocks 加密方式(结果经 stdout 返回，菜单走 stderr)
 get_ss_method() {
     local METHODS=("aes-128-gcm" "aes-256-gcm" "chacha20-ietf-poly1305" "2022-blake3-aes-128-gcm" "2022-blake3-aes-256-gcm" "2022-blake3-chacha20-poly1305")
     echo -e "选择加密方式:" >&2
@@ -1030,7 +990,6 @@ get_ss_method() {
     done
 }
 
-# 按加密方式生成合规的 SS 密码(2022 系列自动生成 base64 密钥)
 get_ss_password() {
     local method=$1
     case "$method" in
@@ -1040,7 +999,6 @@ get_ss_password() {
     esac
 }
 
-# 校验 SS 密码是否符合所选方法格式(2022 系列: base64 且 16/32 字节精确)
 get_ss_pass_valid() {
     local method=$1 pass=$2
     case "$method" in
@@ -1052,7 +1010,6 @@ get_ss_pass_valid() {
     esac
 }
 
-# 生成不冲突的节点 tag(冲突时自动追加 -2/-3 递增)
 get_unique_tag() {
     local base_tag=$1
     local counter=2
@@ -1064,7 +1021,6 @@ get_unique_tag() {
     echo "$final_tag"
 }
 
-# 读取节点关键字段(10 列；兼容 shadowsocks 顶层 password)
 node_read() {
     jq -r --arg tag "$1" '
       .inbounds[] | select(.tag==$tag) |
@@ -1081,7 +1037,6 @@ node_read() {
     ' "$CONFIG_FILE" 2>/dev/null
 }
 
-# 依据证书路径推导连接地址/SNI/insecure(域名证书用域名，自签用伪装域名)
 resolve_conn() {
     local cert_path=$1
     local ip=$2
@@ -1101,7 +1056,6 @@ resolve_conn() {
     fi
 }
 
-# 生成节点分享链接(vless/hysteria2/tuic/anytls/ss 五种协议)
 build_share_url() {
     local TAG=$1
     local IP=$2
@@ -1169,7 +1123,6 @@ build_share_url() {
     esac
 }
 
-# 打印单个节点的完整配置详情与分享链接
 print_config_detail() {
     local TAG=$1
     local IP
@@ -1276,8 +1229,6 @@ print_config_detail() {
     fi
 }
 
-
-# 交互选择一个节点(选中写入 TAG；返回 1 表示取消/无节点)
 select_inbound() {
     local old_IFS=$IFS
     IFS=$'\n'
@@ -1307,7 +1258,6 @@ select_inbound() {
     done
 }
 
-# 当目标端口已被其他协议节点使用时输出共存警告
 warn_port_shared() {
     local port=$1 proto=$2 self_tag=$3
     [ -z "$proto" ] && return 1
@@ -1340,7 +1290,6 @@ warn_port_shared() {
     return $found
 }
 
-# 添加节点(全协议分支；失败自动还原配置+清理密钥+回收隧道服务)
 add_config() {
     while true; do
         clear
@@ -1508,7 +1457,6 @@ add_config() {
                     
                     if [ "${CF_FAILED:-0}" -eq 0 ] && [ "$OS_TYPE" == "alpine" ]; then
                         ( umask 077; cat > "/etc/init.d/cloudflared-${TAG}" << 'EOF'
-#!/sbin/openrc-run
 name="cloudflared-@@SB_TAG@@"
 command="/usr/local/bin/cloudflared"
 command_args="tunnel --no-autoupdate --protocol http2 run --token @@SB_TOKEN@@"
@@ -1608,7 +1556,6 @@ EOF
     done
 }
 
-# 修改节点(UUID/密码/端口/名称/SNI/证书；含 REALITY 公钥与 Argo 密钥迁移)
 modify_config() {
     while true; do
         clear
@@ -1926,7 +1873,6 @@ modify_config() {
     done
 }
 
-# 删除节点(含防火墙规则/cloudflared 隧道/密钥的完整清理)
 del_config() {
     while true; do
         clear
@@ -1996,7 +1942,6 @@ del_config() {
     done
 }
 
-# 查看单个节点详情
 view_single_config() {
     while true; do
         clear
@@ -2007,7 +1952,6 @@ view_single_config() {
     done
 }
 
-# 聚合显示全部节点的分享链接
 show_all_links() {
     clear
     echo -e "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -2028,7 +1972,6 @@ show_all_links() {
     pause
 }
 
-# 查看节点菜单(单协议/聚合)
 view_config() {
     while true; do
         clear
@@ -2044,7 +1987,6 @@ view_config() {
     done
 }
 
-# 运行管理(启动/停止/重启；启动复用 restart_service 带配置校验)
 run_manage() {
     while true; do
         clear
@@ -2076,7 +2018,6 @@ run_manage() {
     done
 }
 
-# 更新管理(内核更新/脚本更新/强制覆盖重装)
 update_manage() {
     while true; do
         clear
@@ -2146,7 +2087,6 @@ update_manage() {
     done
 }
 
-# 开启 BBR 加速(先备份原有 sysctl 配置，写入 /etc/sysctl.d/99-bbr.conf)
 enable_bbr() {
     echo -e "${CYAN}==> 尝试开启 BBR 加速...${PLAIN}"
     local current_cc
@@ -2192,7 +2132,6 @@ EOF
     pause
 }
 
-# 配置出站 IPv4/IPv6 策略(1.12+ 自动迁移到 domain_resolver 新格式)
 config_outbound() {
     while true; do
         clear
@@ -2250,7 +2189,6 @@ config_outbound() {
     done
 }
 
-# 其他功能菜单(BBR/出站策略)
 other_manage() {
     while true; do
         clear
@@ -2268,11 +2206,12 @@ other_manage() {
     done
 }
 
-# 彻底卸载(服务/二进制/配置/防火墙规则/acme 续期/sysctl 还原)
 uninstall_all() {
     local un
     ask "确认卸载脚本、sing-box和所有节点配置吗？(y/n): " un
     if [[ "$un" == "y" ]]; then
+        load_secrets
+        [ -z "${_UNINST_SRC:-}" ] && _UNINST_SRC="${INSTALLER_SRC:-}"
         remove_all_fw_rules
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service sing-box stop >/dev/null 2>&1
@@ -2319,11 +2258,18 @@ uninstall_all() {
         fi
         [ -n "$SYSCTL_BAK_TMP" ] && rm -f "$SYSCTL_BAK_TMP"
         
+        local _src=""
+        [ -n "${_UNINST_SRC:-}" ] && _src="$_UNINST_SRC"
+        [ -z "$_src" ] && [[ "${0}" != "/usr/local/bin/sb" && "${0}" != "sb" && "${0}" != *"/sb" ]] && _src="${0}"
+        if [ -n "$_src" ] && [ -f "$_src" ] && [ "$_src" != "/usr/local/bin/sb" ]; then
+            rm -f "$_src"
+            [ -f "$_src" ] && echo -e "${YELLOW}提示: 安装器文件 ${_src} 删除失败，请手动移除。${PLAIN}" || echo -e "${GREEN}已删除初始安装器: ${_src}${PLAIN}"
+        fi
+        
         echo -e "${GREEN}已彻底卸载！系统已恢复原状。${PLAIN}"
     fi
 }
 
-# 主菜单循环(状态栏实时显示版本/运行状态/新版本提示)
 menu() {
     init_base || { echo -e "${RED}系统环境初始化失败，无法继续运行！${PLAIN}"; exit 1; }
     local LATEST_VER_CACHE
@@ -2379,9 +2325,6 @@ menu() {
     done
 }
 
-# ====================================================================================================
-# 入口分流: 直接运行安装器 -> 引导安装/更新/卸载; 通过 sb 命令运行 -> 直接进入面板
-# ====================================================================================================
 if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" ]]; then
     if [ -f "/usr/local/bin/sb" ]; then
         clear
@@ -2390,6 +2333,8 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
         echo -e " 2. 卸载脚本 + 内核"
         echo -e " 3. 进入面板"
         echo -e " 4. 退出\n"
+        mkdir -p "$CONFIG_DIR" 2>/dev/null
+        save_secret "INSTALLER_SRC" "$0"
         ask "请选择 [1-4]: " pre_choice
         case "$pre_choice" in
             1)
@@ -2442,6 +2387,8 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
         esac
     else
         echo -e "${CYAN}==> 正在将管理脚本写入到全局环境...${PLAIN}"
+        mkdir -p "$CONFIG_DIR" 2>/dev/null
+        save_secret "INSTALLER_SRC" "$0"
         if fetch_script; then
             echo -e "\n${GREEN}==> 脚本安装完成！以后可随时输入 ${YELLOW}sb${GREEN} 快捷调用本面板。${PLAIN}"
             sleep 2
