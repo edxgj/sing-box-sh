@@ -11,3 +11,5 @@ TUIC
 AnyTLS
 
 VLESS-Argo
+
+shadowsocks
