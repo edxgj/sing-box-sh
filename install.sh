@@ -63,7 +63,8 @@ elif command -v apt-get >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     OS_TYPE="centos"
 else
-    OS_TYPE="debian"
+    echo '不支持的系统：需要 apk、apt-get、dnf 或 yum。' >&2
+    exit 1
 fi
 
 ARCH=$(uname -m)
@@ -439,37 +440,47 @@ close_fw_port() {
     fi
 
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then
-        ufw delete allow "${port}"/"${proto}" >/dev/null 2>&1
+        printf '保留 UFW 规则 %s/%s：旧记录不能证明归属，请手动核查。\n' "$port" "$proto" >&2
+        return 1
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --remove-port="${port}"/"${proto}" --permanent >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
+        printf '保留 firewalld 规则 %s/%s：无法确认是否被其他服务共享，请手动核查。\n' "$port" "$proto" >&2
+        return 1
     elif command -v iptables >/dev/null 2>&1; then
         while iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; do
-            iptables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || break
+            iptables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || return 1
         done
         if command -v ip6tables >/dev/null 2>&1; then
             while ip6tables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; do
-                ip6tables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || break
+                ip6tables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || return 1
             done
         fi
         if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1
+            netfilter-persistent save >/dev/null 2>&1 || return 1
         elif command -v iptables-save >/dev/null 2>&1; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-            command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || return 1
+            if command -v ip6tables-save >/dev/null 2>&1; then
+                ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || return 1
+            fi
         fi
+    else
+        echo '无法确认防火墙规则已删除，保留追踪记录。' >&2
+        return 1
     fi
+    return 0
 }
 
 remove_all_fw_rules() {
-    if [ -f "$FW_PORTS_FILE" ]; then
-        while IFS="/" read -r port proto; do
-            if [ -n "$port" ] && [ -n "$proto" ]; then
-                close_fw_port "$port" "$proto"
-            fi
-        done < "$FW_PORTS_FILE"
-        rm -f "$FW_PORTS_FILE"
+    local port proto failed=0
+    [ -f "$FW_PORTS_FILE" ] || return 0
+    while IFS="/" read -r port proto; do
+        [ -n "$port" ] && [ -n "$proto" ] || continue
+        if ! close_fw_port "$port" "$proto"; then failed=1; fi
+    done < "$FW_PORTS_FILE"
+    if [ "$failed" != 0 ]; then
+        echo '部分防火墙规则未清理，记录已保留；请处理后重试。' >&2
+        return 1
     fi
+    rm -f "$FW_PORTS_FILE"
 }
 
 migrate_certs() {
@@ -608,7 +619,7 @@ install_kernel() {
         # Extract only the expected binary, never arbitrary archive paths.
         tar -xzf "$d/archive" -C "$d/extract" "sing-box-${ver}-linux-${SB_ARCH}/sing-box" || exit 1
         newbin="$d/extract/sing-box-${ver}-linux-${SB_ARCH}/sing-box"
-        [ -f "$newbin" ] && [ ! -L "$newbin" ] && chmod 755 "$newbin" || exit 1
+        [ -f "$newbin" ] && [ ! -L "$newbin" ] && chown 0:0 "$newbin" && chmod 755 "$newbin" || exit 1
         "$newbin" version >/dev/null 2>&1 || exit 1
         if [ "$mode" != norestart ] && [ -f "$CONFIG_FILE" ]; then "$newbin" check -c "$CONFIG_FILE" || exit 1; fi
         touched=1
@@ -636,26 +647,25 @@ ensure_deps() {
         case "$c" in
             crontab) if [ "$OS_TYPE" == "alpine" ]; then pkgs+=(dcron); elif [ "$OS_TYPE" == "centos" ]; then pkgs+=(cronie); else pkgs+=(cron); fi ;;
             ss) if [ "$OS_TYPE" = "centos" ]; then pkgs+=(iproute); else pkgs+=(iproute2); fi ;;
+            flock) if [ "$OS_TYPE" = "alpine" ]; then pkgs+=(flock); else pkgs+=(util-linux); fi ;;
             *)       pkgs+=("$c") ;;
         esac
     done
 
+    pkgs+=(ca-certificates)
     if [ "$OS_TYPE" == "alpine" ]; then
-        apk update >/dev/null 2>&1
-        apk add "${pkgs[@]}" >/dev/null 2>&1
+        apk add --no-cache "${pkgs[@]}" || return 1
     elif [ "$OS_TYPE" == "centos" ]; then
-        if command -v dnf >/dev/null 2>&1; then
-            dnf install -y epel-release >/dev/null 2>&1
-            dnf install -y "${pkgs[@]}" >/dev/null 2>&1
-        else
-            yum install -y epel-release >/dev/null 2>&1
-            yum install -y "${pkgs[@]}" >/dev/null 2>&1
-        fi
+        local pm=yum
+        command -v dnf >/dev/null 2>&1 && pm=dnf
+        "$pm" install -y "${pkgs[@]}" || {
+            echo '依赖安装失败，请检查软件仓库；部分系统需要管理员启用 EPEL。' >&2
+            return 1
+        }
     else
-        apt-get update -y >/dev/null 2>&1
-        apt-get install -y "${pkgs[@]}" >/dev/null 2>&1
+        apt-get update || return 1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}" || return 1
     fi
-
     local still=()
     for c in "${miss[@]}"; do
         command -v "$c" >/dev/null 2>&1 || still+=("$c")
@@ -864,6 +874,49 @@ get_domain() {
     printf '%s\n' "$val"
 }
 
+
+confirm_http01_ready() {
+    local confirmed=""
+    echo 'HTTP-01 首次申请和后续自动续期都需要公网 80/TCP 可达，且验证时端口不能被其他程序占用。' >&2
+    echo '本脚本不自动修改 80/TCP 防火墙规则。请维护长期放行；无法保证时请选择 DNS 验证。' >&2
+    if check_port 80 tcp; then
+        echo '本机 80/TCP 已被占用，取消 standalone 申请。' >&2
+        return 1
+    fi
+    ask "已确认长期放行 80/TCP 并为续期保留端口？(y/n) [默认: n]: " confirmed
+    case "$confirmed" in
+        y|Y) return 0 ;;
+        *) echo '已取消 HTTP-01 申请，可重新选择 DNS 验证。' >&2; return 1 ;;
+    esac
+}
+
+ensure_acme_installed() {
+    [ -f "$HOME/.acme.sh/acme.sh" ] && return 0
+    local installer failed=0
+    installer=$(mktemp /tmp/sb-acme-install.XXXXXX) || return 1
+    SB_OWNED_TEMP_FILES+=("$installer")
+    if ! curl -fL --connect-timeout 15 --max-time 120 --retry 2 \
+        -o "$installer" https://get.acme.sh; then
+        # Discard any partial curl output before trying the fallback.
+        : > "$installer"
+        wget -T 30 -O "$installer" https://get.acme.sh || failed=1
+    fi
+    if [ "$failed" = 0 ]; then
+        if [ ! -s "$installer" ] || ! sh -n "$installer"; then
+            failed=1
+        elif ! sh "$installer"; then
+            failed=1
+        elif [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
+            failed=1
+        fi
+    fi
+    rm -f -- "$installer"
+    if [ "$failed" != 0 ]; then
+        echo 'acme.sh 引导安装失败，停止证书申请；请检查网络及安装日志。' >&2
+        return 1
+    fi
+    return 0
+}
 apply_real_cert() {
     local NEW_DOMAIN
     NEW_DOMAIN=$(get_domain "请输入解析到本机的域名" "") || exit 1
@@ -907,27 +960,19 @@ apply_real_cert() {
         if [[ "$v_mode" == "1" || "$v_mode" == "2" ]]; then break; fi
     done
 
-    if [ ! -f ~/.acme.sh/acme.sh ]; then
-        if command -v curl >/dev/null 2>&1; then
-            curl -sL https://get.acme.sh | sh
-        elif command -v wget >/dev/null 2>&1; then
-            wget -qO - https://get.acme.sh | sh
-        fi
-        if [ ! -f ~/.acme.sh/acme.sh ]; then
-            echo -e "${RED}acme.sh 安装失败！请检查网络后重试。${PLAIN}"
-            return 1
-        fi
-    fi
+    ensure_acme_installed || return 1
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
 
     if [ "$v_mode" == "1" ]; then
-        open_fw_port 80 tcp >/dev/null
+        if ! confirm_http01_ready; then
+            return 1
+        fi
         local issue_ok=1
         if ! ~/.acme.sh/acme.sh --issue -d "${NEW_DOMAIN}" --standalone --force; then
             issue_ok=0
         fi
-        close_fw_port 80 tcp
-        sed -i "\\|^80/tcp\$|d" "$FW_PORTS_FILE" 2>/dev/null
+        # Firewall access is maintained by the administrator for future renewals.
+        # Never remove existing rules or create a temporary-only allowance here.
         if [ "$issue_ok" -eq 0 ]; then
             echo -e "${RED}申请失败！请检查域名解析和 80 端口是否连通。${PLAIN}"
             return 1
@@ -1125,7 +1170,7 @@ cert_manage() {
                     echo -e "绑定的域名\t: ${GREEN}${REAL_DOMAIN}${PLAIN}"
                     echo -e "证书路径\t: ${GREEN}$CERT_DIR/real.cer${PLAIN}"
                     if crontab -l 2>/dev/null | grep -q "acme.sh"; then
-                        echo -e "${GREEN}acme.sh 自动续期已运行中！${PLAIN}"
+                        echo -e "${YELLOW}检测到 acme.sh 定时任务；尚未验证 cron 服务、此域名的续期记录及最近执行结果。${PLAIN}"
                     else
                         echo -e "${RED}警告: 未发现自动续期任务！${PLAIN}"
                     fi
@@ -1607,7 +1652,19 @@ add_config() {
         done
         local TAG
         TAG=$(get_unique_tag "$input_tag")
-        
+        if [ "$proto_idx" = 5 ]; then
+            if [ -e "/etc/init.d/cloudflared-$TAG" ] || [ -L "/etc/init.d/cloudflared-$TAG" ] ||
+               [ -e "/etc/systemd/system/cloudflared-$TAG.service" ] || [ -L "/etc/systemd/system/cloudflared-$TAG.service" ]; then
+                echo '同名隧道服务已存在，请选择其他节点名称。' >&2
+                continue
+            fi
+        fi
+
+        # Certificate deployment is an independent transaction. Snapshot node
+        # metadata only after it finishes, so a node rollback cannot undo it.
+        case "$proto_idx" in
+            2|3|4) prompt_cert_type || continue ;;
+        esac
         backup_config || return 1
         local IS_ARGO=0
         local jq_ok=1
@@ -1634,7 +1691,7 @@ add_config() {
             2)
                 local PASS
                 PASS=$(get_pass) || exit 1
-                if ! prompt_cert_type; then commit_config || return 1; continue; fi
+                # Certificate paths were selected before backup_config.
                 
                 apply_jq_config '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' \
                 --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
@@ -1644,7 +1701,7 @@ add_config() {
                 UUID=$(get_uuid) || exit 1
                 local PASS
                 PASS=$(get_pass) || exit 1
-                if ! prompt_cert_type; then commit_config || return 1; continue; fi
+                # Certificate paths were selected before backup_config.
                 
                 apply_jq_config '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' \
                 --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
@@ -1652,7 +1709,7 @@ add_config() {
             4)
                 local PASS
                 PASS=$(get_pass) || exit 1
-                if ! prompt_cert_type; then commit_config || return 1; continue; fi
+                # Certificate paths were selected before backup_config.
                 
                 apply_jq_config '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h2","http/1.1"],"certificate_path":$cert,"key_path":$key}}]' \
                 --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
@@ -1680,16 +1737,22 @@ add_config() {
                 --argjson p "$PORT" --arg uuid "$UUID" --arg tag "$TAG"; then
                     jq_ok=0
                 else
-                    local CF_FAILED=0
-                    if ! command -v cloudflared &> /dev/null; then
+                    local CF_FAILED=0 CF_BIN
+                    CF_BIN=$(type -P cloudflared) || CF_BIN=""
+                    if [ -z "$CF_BIN" ]; then
+                        CF_BIN=/usr/local/bin/cloudflared
                         echo -e "${CYAN}正在下载 cloudflared 组件...${PLAIN}"
                         local TMP_CF
                         TMP_CF=$(mktemp)
                         local cf_arch="amd64"
                         [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && cf_arch="arm64"
                         if fetch_url "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" "$TMP_CF"; then
-                            mv "$TMP_CF" /usr/local/bin/cloudflared
-                            chmod +x /usr/local/bin/cloudflared
+                            if ! chmod 755 "$TMP_CF" ||
+                               ! chown 0:0 "$TMP_CF" ||
+                               ! mv "$TMP_CF" /usr/local/bin/cloudflared; then
+                                rm -f "$TMP_CF"
+                                CF_FAILED=1
+                            fi
                         else
                             echo -e "${RED}下载 cloudflared 失败！${PLAIN}"
                             rm -f "$TMP_CF"
@@ -1697,22 +1760,41 @@ add_config() {
                         fi
                     fi
                     
+                    # Restrict paths interpolated into service files and sed.
+                    # Reject shell functions, relative paths and unsafe characters.
+                    if [[ ! "$CF_BIN" =~ ^/[A-Za-z0-9_./-]+$ ]] ||
+                       [ ! -f "$CF_BIN" ] || [ ! -x "$CF_BIN" ]; then
+                        echo 'cloudflared 路径无效，拒绝创建服务。' >&2
+                        CF_FAILED=1
+                    elif [ "$CF_FAILED" = 0 ] && ! "$CF_BIN" --version >/dev/null 2>&1; then
+                        echo 'cloudflared 无法运行，拒绝创建服务。' >&2
+                        CF_FAILED=1
+                    fi
+                    if [ "$CF_FAILED" = 0 ]; then
+                        CONFIG_TX_ARGO_PENDING="$TAG"
+                    fi
                     if [ "${CF_FAILED:-0}" -eq 0 ] && [ "$OS_TYPE" == "alpine" ]; then
                         ( umask 077; cat > "/etc/init.d/cloudflared-${TAG}" << 'EOF'
 #!/sbin/openrc-run
 name="cloudflared-@@SB_TAG@@"
-command="/usr/local/bin/cloudflared"
+command="@@SB_CF_BIN@@"
 command_args="tunnel --no-autoupdate --protocol http2 run --token @@SB_TOKEN@@"
 command_background=true
 pidfile="/var/run/cloudflared-@@SB_TAG@@.pid"
 depend() { need net; }
 EOF
                         )
-                        sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/init.d/cloudflared-${TAG}"
-                        sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/init.d/cloudflared-${TAG}"
-                        chmod 700 "/etc/init.d/cloudflared-${TAG}"
-                        rc-update add "cloudflared-${TAG}" default >/dev/null 2>&1
+                        if ! sed -i "s|@@SB_CF_BIN@@|${CF_BIN}|g" "/etc/init.d/cloudflared-${TAG}"; then
+                            cleanup_created_argo_service "$TAG" || return 1
+                            restore_config_and_service || return 1
+                            return 1
+                        fi
+                        sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/init.d/cloudflared-${TAG}" &&
+                        sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/init.d/cloudflared-${TAG}" &&
+                        chmod 700 "/etc/init.d/cloudflared-${TAG}" &&
+                        rc-update add "cloudflared-${TAG}" default >/dev/null 2>&1 &&
                         rc-service "cloudflared-${TAG}" restart >/dev/null 2>&1 &&
+                        rc-service "cloudflared-${TAG}" status >/dev/null 2>&1 &&
                         register_argo_service "cloudflared-${TAG}" || CF_FAILED=1
                     elif [ "${CF_FAILED:-0}" -eq 0 ]; then
                         ( umask 077; cat > "/etc/systemd/system/cloudflared-${TAG}.service" << 'EOF'
@@ -1720,22 +1802,39 @@ EOF
 Description=cloudflared tunnel for @@SB_TAG@@
 After=network.target
 [Service]
-ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --protocol http2 run --token @@SB_TOKEN@@
+ExecStart=@@SB_CF_BIN@@ tunnel --no-autoupdate --protocol http2 run --token @@SB_TOKEN@@
 Restart=on-failure
 RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
                         )
-                        sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/systemd/system/cloudflared-${TAG}.service"
-                        sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/systemd/system/cloudflared-${TAG}.service"
-                        chmod 600 "/etc/systemd/system/cloudflared-${TAG}.service"
-                        systemctl daemon-reload >/dev/null 2>&1
+                        if ! sed -i "s|@@SB_CF_BIN@@|${CF_BIN}|g" "/etc/systemd/system/cloudflared-${TAG}.service"; then
+                            cleanup_created_argo_service "$TAG" || return 1
+                            restore_config_and_service || return 1
+                            return 1
+                        fi
+                        sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/systemd/system/cloudflared-${TAG}.service" &&
+                        sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/systemd/system/cloudflared-${TAG}.service" &&
+                        chmod 600 "/etc/systemd/system/cloudflared-${TAG}.service" &&
+                        systemctl daemon-reload >/dev/null 2>&1 &&
                         systemctl enable "cloudflared-${TAG}" --now >/dev/null 2>&1 &&
+                        systemctl is-active --quiet "cloudflared-${TAG}" &&
                         register_argo_service "cloudflared-${TAG}" || CF_FAILED=1
                     else
-                        echo -e "${RED}cloudflared 组件缺失且下载失败，节点已添加但隧道未运行！${PLAIN}"
-                        echo -e "${YELLOW}请稍后重新添加该节点，或手动安装 cloudflared 后自行启动隧道服务。${PLAIN}"
+                        echo -e "${RED}cloudflared 检查失败，本次节点将回滚。${PLAIN}"
+                        echo -e "${YELLOW}请检查组件下载、可执行路径及运行环境后重试。${PLAIN}"
+                    fi
+                    if [ "$CF_FAILED" -ne 0 ]; then
+                        # Preserve metadata and backup when service cleanup fails.
+                        if ! cleanup_created_argo_service "$TAG"; then
+                            echo '隧道清理失败，停止操作；请检查服务与事务备份。' >&2
+                            return 1
+                        fi
+                        restore_config_and_service || return 1
+                        echo '隧道创建失败，节点配置已恢复。' >&2
+                        pause
+                        continue
                     fi
                 fi
                 ;;
@@ -1756,8 +1855,6 @@ EOF
                 ;;
         esac
         
-        local NODE_SEC_TYPE=""
-        [ "$proto_idx" == "1" ] && NODE_SEC_TYPE="vless"
 
         if [ "$jq_ok" -eq 0 ]; then
             restore_config_and_service || return 1
@@ -1766,20 +1863,14 @@ EOF
         fi
 
         if ! restart_service; then
-            echo -e "${RED}节点添加失败(校验报错)，已为您还原配置！${PLAIN}"
-            restore_config_and_service || return 1
+            echo '节点启动失败，正在清理本次隧道并恢复配置。' >&2
             if [ "$IS_ARGO" -eq 1 ]; then
-                if [ "$OS_TYPE" == "alpine" ]; then
-                    rc-service "cloudflared-${TAG}" stop >/dev/null 2>&1
-                    rc-update del "cloudflared-${TAG}" default >/dev/null 2>&1
-                    rm -f "/etc/init.d/cloudflared-${TAG}"
-                else
-                    systemctl stop "cloudflared-${TAG}" >/dev/null 2>&1
-                    systemctl disable "cloudflared-${TAG}" >/dev/null 2>&1
-                    rm -f "/etc/systemd/system/cloudflared-${TAG}.service"
-                    systemctl daemon-reload >/dev/null 2>&1
-                fi
+                cleanup_created_argo_service "$TAG" || {
+                    echo '隧道清理失败，保留事务信息；请先处理残留服务。' >&2
+                    return 1
+                }
             fi
+            restore_config_and_service || return 1
             pause
             continue
         fi
@@ -1892,6 +1983,12 @@ modify_config() {
                 continue
             fi
 
+            if [ "$action" = cert ]; then
+                if ! prompt_cert_type; then
+                    pause
+                    continue
+                fi
+            fi
             backup_config || return 1
 
             if [ "$action" == "uuid" ] || [ "$action" == "pass" ]; then
@@ -1936,7 +2033,8 @@ modify_config() {
                 pause
                 
             elif [ "$action" == "cert" ]; then
-                if prompt_cert_type; then
+                # Paths were selected before the node transaction began.
+                if [ -s "$SEL_CERT" ] && [ -s "$SEL_KEY" ]; then
                     if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tls.certificate_path) = $cert | (.inbounds[] | select(.tag==$tag) | .tls.key_path) = $key' \
                     --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY"; then
                         commit_config || return 1
@@ -2034,8 +2132,11 @@ modify_config() {
                     echo -e "${GREEN}端口已更改为: $NEW_PORT${PLAIN}"
                     
                     if [ -n "$f_proto" ] && [ "$OLD_PORT" != "$NEW_PORT" ]; then
-                        close_fw_port "$OLD_PORT" "$f_proto"
-                        remove_fw_record "${OLD_PORT}" "$f_proto"
+                        if close_fw_port "$OLD_PORT" "$f_proto"; then
+                            remove_fw_record "${OLD_PORT}" "$f_proto" || return 1
+                        else
+                            echo '旧端口规则清理未完成，记录已保留。' >&2
+                        fi
                         ask "是否自动放行新端口？(y/n) [默认: y]: " auto_fw
                         if [[ "${auto_fw:-y}" == "y" || "${auto_fw:-y}" == "Y" ]]; then open_fw_port "$NEW_PORT" "$f_proto"; fi
                     fi
@@ -2151,8 +2252,11 @@ del_config() {
         fi
 
         if [ -n "$f_proto" ]; then
-            close_fw_port "$PORT" "$f_proto"
-                        remove_fw_record "${PORT}" "$f_proto"
+            if close_fw_port "$PORT" "$f_proto"; then
+                remove_fw_record "${PORT}" "$f_proto" || return 1
+            else
+                echo '节点已删除，但防火墙规则及记录保留，请手动核查。' >&2
+            fi
         fi
         
         if [ "$IS_ARGO" -eq 1 ]; then
@@ -2226,6 +2330,7 @@ view_config() {
 }
 
 run_manage() {
+    local run_idx=""
     while true; do
         clear
         echo -e "选择: 运行管理\n"
@@ -2236,7 +2341,11 @@ run_manage() {
         while true; do
             ask "请选择 [0-3]: " run_idx
             case "$run_idx" in
-                1|3) 
+                1|3)
+                   if [ "$run_idx" = 1 ] && service_is_active; then
+                       echo -e "${GREEN}服务已运行，无需重复启动。${PLAIN}"
+                       pause; break
+                   fi
                    local INBOUND_COUNT
                    INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE 2>/dev/null)
                    if [ -z "$INBOUND_COUNT" ] || [ "$INBOUND_COUNT" -eq 0 ]; then echo -e "${RED}未添加节点配置！${PLAIN}"; pause; break; fi
@@ -2341,6 +2450,11 @@ enable_bbr() {
         return
     fi
 
+    if [ -e /etc/sysctl.d/99-bbr.conf ] || [ -L /etc/sysctl.d/99-bbr.conf ]; then
+        echo '发现已有 /etc/sysctl.d/99-bbr.conf，拒绝覆盖。请先手动检查该配置。' >&2
+        pause
+        return 1
+    fi
     modprobe tcp_bbr 2>/dev/null
 
     if [ -f /etc/sysctl.conf ]; then
@@ -2377,6 +2491,7 @@ EOF
 }
 
 config_outbound() {
+    local out_idx=""
     while true; do
         clear
         local current_strategy
@@ -2434,6 +2549,7 @@ config_outbound() {
 }
 
 other_manage() {
+    local om_idx=""
     while true; do
         clear
         echo -e "选择: 其他\n"
@@ -2456,7 +2572,10 @@ uninstall_all() {
     if [[ "$un" == "y" ]]; then
         load_secrets
         [ -z "${_UNINST_SRC:-}" ] && _UNINST_SRC="${INSTALLER_SRC:-}"
-        remove_all_fw_rules
+        remove_all_fw_rules || {
+            echo '卸载暂停：防火墙规则尚未确认清理，未删除配置。' >&2
+            return 1
+        }
         if [ "$OS_TYPE" == "alpine" ]; then
             rc-service sing-box stop >/dev/null 2>&1
             rc-update del sing-box default >/dev/null 2>&1
@@ -2493,25 +2612,24 @@ uninstall_all() {
             fi
         fi
         
-        SYSCTL_BAK_TMP=""
+        # cloudflared may be shared with tunnels not managed by this script.
+        # Legacy installations have no trustworthy component ownership record.
         if [ -f "$CONFIG_DIR/.sysctl_backup" ]; then
-            SYSCTL_BAK_TMP=$(mktemp) && cp -f "$CONFIG_DIR/.sysctl_backup" "$SYSCTL_BAK_TMP" 2>/dev/null
+            local retained_backup
+            retained_backup=$(mktemp /root/sing-box-sysctl-backup.XXXXXX) || return 1
+            if ! cp -p "$CONFIG_DIR/.sysctl_backup" "$retained_backup"; then
+                rm -f "$retained_backup"
+                return 1
+            fi
+            printf '旧版 sysctl 备份已保留：%s\n' "$retained_backup"
         fi
+        rm -rf /usr/local/bin/sing-box /usr/local/bin/sb /etc/sing-box || return 1
+        echo '已保留 cloudflared 组件，避免影响其他隧道；确认无其他使用者后可手动删除。'
 
-        rm -rf /usr/local/bin/sing-box /usr/local/bin/cloudflared /usr/local/bin/sb /etc/sing-box
         
-        rm -f /etc/sysctl.d/99-bbr.conf 2>/dev/null
-        if [ -n "$SYSCTL_BAK_TMP" ] && [ -s "$SYSCTL_BAK_TMP" ]; then
-            sed -i '/^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=/d; /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/d' /etc/sysctl.conf 2>/dev/null
-            cat "$SYSCTL_BAK_TMP" >> /etc/sysctl.conf 2>/dev/null
-            sysctl -p /etc/sysctl.conf >/dev/null 2>&1
-            echo -e "${GREEN}已还原 /etc/sysctl.conf 中原有的 qdisc/拥塞控制设置。${PLAIN}"
-        else
-            sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
-            sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1
-        fi
-        [ -n "$SYSCTL_BAK_TMP" ] && rm -f "$SYSCTL_BAK_TMP"
-        
+        # Do not guess original kernel values or remove an unowned sysctl file.
+        echo 'BBR 和系统队列设置保持不变；本次卸载不会重置系统网络参数。'
+
         local _src=""
         [ -n "${_UNINST_SRC:-}" ] && _src="$_UNINST_SRC"
         [ -z "$_src" ] && [[ "${0}" != "/usr/local/bin/sb" && "${0}" != "sb" && "${0}" != *"/sb" ]] && _src="${0}"
@@ -2520,11 +2638,12 @@ uninstall_all() {
             [ -f "$_src" ] && echo -e "${YELLOW}提示: 安装器文件 ${_src} 删除失败，请手动移除。${PLAIN}" || echo -e "${GREEN}已删除初始安装器: ${_src}${PLAIN}"
         fi
         
-        echo -e "${GREEN}已彻底卸载！系统已恢复原状。${PLAIN}"
+        echo -e "${GREEN}脚本与节点配置已卸载；共享组件及系统网络参数已保留。${PLAIN}"
     fi
 }
 
 menu() {
+    local choice=""
     init_base || { echo -e "${RED}系统环境初始化失败，无法继续运行！${PLAIN}"; exit 1; }
     local LATEST_VER_CACHE
     LATEST_VER_CACHE=$(get_latest_version)
@@ -2576,18 +2695,54 @@ menu() {
             0) exit 0 ;;
             *) echo "输入错误!"; sleep 1 ;;
         esac
+        if [ "${CONFIG_TX_BLOCKED:-0}" = 1 ]; then
+            echo '存在未完成恢复的事务，退出管理面板；请保留备份并人工检查。' >&2
+            exit 1
+        fi
     done
 }
 
 
 commit_config() {
+    if [ "${CONFIG_TX_BLOCKED:-0}" = 1 ]; then
+        echo '事务被阻塞，拒绝删除备份。' >&2
+        return 1
+    fi
     rm -f "${CONFIG_FILE}.bak" || return 1
     if [ -n "${CONFIG_TX_DIR:-}" ]; then
         rm -rf "$CONFIG_TX_DIR" || return 1
         CONFIG_TX_DIR=""
     fi
+    CONFIG_TX_ARGO_PENDING=""
 }
 
+
+
+rename_argo_registration() {
+    local old="$1" new="$2" svc updated="" seen=0
+    local -a registered=()
+    [[ "$old" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || return 1
+    [[ "$new" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || return 1
+    load_secrets || return 1
+    IFS=',' read -r -a registered <<< "${ARGO_SERVICES:-}"
+    for svc in "${registered[@]}"; do
+        [ -n "$svc" ] || continue
+        [[ "$svc" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || {
+            echo '隧道服务登记记录无效，拒绝覆盖。' >&2
+            return 1
+        }
+        [ "$svc" != "$old" ] || svc="$new"
+        if [ "$svc" = "$new" ]; then
+            [ "$seen" = 0 ] || continue
+            seen=1
+        fi
+        updated="${updated:+${updated},}${svc}"
+    done
+    # Repair legacy records where the existing service was not registered.
+    [ "$seen" = 1 ] || updated="${updated:+${updated},}${new}"
+    save_secret ARGO_SERVICES "$updated" || return 1
+    ARGO_SERVICES="$updated"
+}
 
 rename_argo_service() {
     local old="$1" new="$2" src dst d enabled=0 active=0
@@ -2613,7 +2768,12 @@ rename_argo_service() {
            mv "$src" "$dst" &&
            sed -i "s/cloudflared-$old/cloudflared-$new/g" "$dst" &&
            rc-update add "cloudflared-$new" default &&
-           rc-service "cloudflared-$new" start; then rm -rf "$d"; return 0; fi
+           rc-service "cloudflared-$new" start &&
+           rc-service "cloudflared-$new" status >/dev/null 2>&1 &&
+           rename_argo_registration "cloudflared-$old" "cloudflared-$new"; then
+            rm -rf "$d"
+            return 0
+        fi
         rc-service "cloudflared-$new" stop >/dev/null 2>&1
         rc-update del "cloudflared-$new" default >/dev/null 2>&1
     else
@@ -2623,7 +2783,11 @@ rename_argo_service() {
            sed -i "s/tunnel for $old/tunnel for $new/g" "$dst" &&
            systemctl daemon-reload &&
            systemctl enable "cloudflared-$new" --now &&
-           systemctl is-active --quiet "cloudflared-$new"; then rm -rf "$d"; return 0; fi
+           systemctl is-active --quiet "cloudflared-$new" &&
+           rename_argo_registration "cloudflared-$old" "cloudflared-$new"; then
+            rm -rf "$d"
+            return 0
+        fi
         systemctl stop "cloudflared-$new" >/dev/null 2>&1
         systemctl disable "cloudflared-$new" >/dev/null 2>&1
     fi
@@ -2655,6 +2819,93 @@ remove_fw_record() {
         "$FW_PORTS_FILE" > "$tmp" && mv -f "$tmp" "$FW_PORTS_FILE"; then return 0; fi
     rm -f "$tmp"; return 1
 }
+
+service_is_active() {
+    if [ "$OS_TYPE" = alpine ]; then
+        rc-service sing-box status >/dev/null 2>&1
+    else
+        systemctl is-active --quiet sing-box
+    fi
+}
+
+snapshot_service_state() {
+    local d="$1" active=0 enabled=0
+    service_is_active && active=1
+    if [ "$OS_TYPE" = alpine ]; then
+        [ -e /etc/runlevels/default/sing-box ] && enabled=1
+    else
+        systemctl is-enabled --quiet sing-box && enabled=1
+    fi
+    printf '%s\n' "$active" > "$d/service.active" &&
+    printf '%s\n' "$enabled" > "$d/service.enabled"
+}
+
+restore_service_state() {
+    local d="$1" active enabled failed=0
+    IFS= read -r active < "$d/service.active" || return 1
+    IFS= read -r enabled < "$d/service.enabled" || return 1
+    case "$active:$enabled" in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
+    if [ "$active" = 1 ]; then
+        restart_service || failed=1
+    elif service_is_active; then
+        if [ "$OS_TYPE" = alpine ]; then
+            rc-service sing-box stop || failed=1
+        else
+            systemctl stop sing-box || failed=1
+        fi
+        if service_is_active; then failed=1; fi
+    fi
+    if [ "$OS_TYPE" = alpine ]; then
+        if [ "$enabled" = 1 ]; then
+            rc-update add sing-box default || failed=1
+        elif [ -e /etc/runlevels/default/sing-box ]; then
+            rc-update del sing-box default || failed=1
+        fi
+    elif [ "$enabled" = 1 ]; then
+        systemctl enable sing-box || failed=1
+    elif systemctl is-enabled --quiet sing-box; then
+        systemctl disable sing-box || failed=1
+    fi
+    return "$failed"
+}
+
+cleanup_created_argo_service() {
+    if cleanup_created_argo_service_impl "$1"; then
+        if [ "${CONFIG_TX_ARGO_PENDING:-}" = "$1" ]; then
+            CONFIG_TX_ARGO_PENDING=""
+        fi
+        return 0
+    fi
+    CONFIG_TX_BLOCKED=1
+    printf '隧道清理失败，事务已阻塞；备份保留在 %s。请人工恢复后重新运行。\n' "${CONFIG_TX_DIR:-unknown}" >&2
+    return 1
+}
+
+cleanup_created_argo_service_impl() {
+    local tag="$1" failed=0 svc
+    [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    svc="cloudflared-$tag"
+    if [ "$OS_TYPE" = alpine ]; then
+        if rc-service "$svc" status >/dev/null 2>&1; then
+            rc-service "$svc" stop || failed=1
+        fi
+        [ "$failed" = 0 ] || return 1
+        if [ -e "/etc/runlevels/default/$svc" ]; then
+            rc-update del "$svc" default || return 1
+        fi
+        rm -f -- "/etc/init.d/$svc"
+    else
+        if systemctl is-active --quiet "$svc"; then
+            systemctl stop "$svc" || return 1
+        fi
+        if systemctl is-enabled --quiet "$svc"; then
+            systemctl disable "$svc" || return 1
+        fi
+        rm -f -- "/etc/systemd/system/$svc.service" || return 1
+        systemctl daemon-reload
+    fi
+}
+
 backup_config() {
     if [ -n "${CONFIG_TX_DIR:-}" ]; then
         printf '%s\n' '上一次配置事务尚未结束，拒绝覆盖备份。' >&2
@@ -2669,13 +2920,35 @@ backup_config() {
         touch "$d/secrets.absent" || { rm -rf "$d"; return 1; }
     fi
     if ! cp -p "$CONFIG_FILE" "${CONFIG_FILE}.bak"; then rm -rf "$d"; return 1; fi
+    if ! snapshot_service_state "$d"; then rm -rf "$d"; return 1; fi
     CONFIG_TX_DIR="$d"
 }
 restore_config_and_service() {
-    local d="${CONFIG_TX_DIR:-}"
+    if [ "${CONFIG_TX_BLOCKED:-0}" = 1 ]; then
+        echo '事务已阻塞，跳过自动恢复，保留配置、密钥和备份供人工处理。' >&2
+        return 1
+    fi
+    local d="${CONFIG_TX_DIR:-}" active enabled
     if [ -z "$d" ] || [ ! -f "$d/config.json" ]; then
         printf '%s\n' '缺少完整事务备份，拒绝不完整恢复。' >&2
         return 1
+    fi
+    # Check recovery metadata before changing live files or removing a tunnel.
+    if ! IFS= read -r active < "$d/service.active" ||
+       ! IFS= read -r enabled < "$d/service.enabled"; then
+        echo '服务状态备份缺失，拒绝修改当前配置。' >&2
+        return 1
+    fi
+    case "$active:$enabled" in
+        0:0|0:1|1:0|1:1) ;;
+        *) echo '服务状态备份无效，拒绝修改当前配置。' >&2; return 1 ;;
+    esac
+    if [ ! -f "$d/secrets.absent" ] && [ ! -f "$d/secrets" ]; then
+        echo '密钥备份缺失，拒绝修改当前配置。' >&2
+        return 1
+    fi
+    if [ -n "${CONFIG_TX_ARGO_PENDING:-}" ]; then
+        cleanup_created_argo_service "$CONFIG_TX_ARGO_PENDING" || return 1
     fi
     local restore_tmp
     restore_tmp=$(mktemp "${CONFIG_FILE}.restore.XXXXXX") || return 1
@@ -2695,13 +2968,15 @@ restore_config_and_service() {
         fi
     fi
     load_secrets || return 1
-    if ! restart_service; then
+    if ! restore_service_state "$d"; then
         printf '配置与 secrets 已恢复，但服务恢复失败；备份保留在 %s\n' "$d" >&2
         return 1
     fi
     commit_config
 }
 
+# Bootstrap before lock acquisition and the first script download.
+ensure_deps flock curl wget jq || exit 1
 if ! acquire_global_lock; then exit 1; fi
 
 if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" ]]; then
@@ -2714,6 +2989,7 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
         echo -e " 4. 退出\n"
         mkdir -p "$CONFIG_DIR" 2>/dev/null
         save_secret "INSTALLER_SRC" "$0"
+        pre_choice=""
         ask "请选择 [1-4]: " pre_choice
         case "$pre_choice" in
             1)
