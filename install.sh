@@ -2,24 +2,6 @@
 
 umask 077
 
-SB_LOCK_DIR="/run/lock"
-SB_LOCK_FILE="$SB_LOCK_DIR/sing-box-manager.lock"
-SB_LOCK_FD=""
-acquire_global_lock() {
-    mkdir -p "$SB_LOCK_DIR" || return 1
-    exec {SB_LOCK_FD}>"$SB_LOCK_FILE" || return 1
-    if ! flock -n "$SB_LOCK_FD"; then
-        printf '%s\n' '已有另一个管理操作正在执行，请稍后重试。' >&2
-        return 1
-    fi
-}
-release_global_lock() {
-    if [ -n "${SB_LOCK_FD:-}" ]; then
-        flock -u "$SB_LOCK_FD" 2>/dev/null || :
-        eval "exec ${SB_LOCK_FD}>&-" 2>/dev/null || :
-        SB_LOCK_FD=""
-    fi
-}
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -27,6 +9,9 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
+if [ ! -t 1 ] || [ "${TERM:-dumb}" = dumb ] || [ -n "${NO_COLOR:-}" ]; then
+    RED='' GREEN='' YELLOW='' CYAN='' PLAIN=''
+fi
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 CERT_DIR="$CONFIG_DIR/cert"
@@ -92,7 +77,6 @@ cleanup_on_exit() {
     for owned_temp in "${SB_OWNED_TEMP_FILES[@]}"; do
         [ -n "$owned_temp" ] && rm -f -- "$owned_temp" 2>/dev/null
     done
-    release_global_lock
 }
 cleanup_on_interrupt() {
     echo -e "\n${RED}[INFO] 接收到中断信号 (Ctrl+C)，正在清理临时文件并彻底退出...${PLAIN}" >&2
@@ -117,11 +101,11 @@ ARCH=$(uname -m)
 case "$ARCH" in
     x86_64) SB_ARCH="amd64" ;;
     aarch64|arm64) SB_ARCH="arm64" ;;
-    *) echo -e "${RED}错误: 不支持的系统架构 ${ARCH}！${PLAIN}"; exit 1 ;;
+    *) echo -e "${RED}[错误] 错误: 不支持的系统架构 ${ARCH}！${PLAIN}"; exit 1 ;;
 esac
 
 if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}错误: 必须以 root 身份运行本脚本！${PLAIN}"
+    echo -e "${RED}[错误] 错误: 必须以 root 身份运行本脚本！${PLAIN}"
     exit 1
 fi
 
@@ -301,7 +285,7 @@ save_secret() {
         return 1
     fi
     rm -f "$tmp"
-    echo -e "${RED}写入 secrets 失败，已保留原文件！${PLAIN}" >&2
+    echo -e "${RED}[错误] 写入 secrets 失败，已保留原文件！${PLAIN}" >&2
     return 1
 }
 
@@ -480,9 +464,9 @@ open_fw_port() {
         if ! sort -u -o "$tmp_fw" "$tmp_fw" || ! chmod 600 "$tmp_fw" || ! mv -f "$tmp_fw" "$FW_PORTS_FILE"; then
             rm -f "$tmp_fw"; return 1
         fi
-        echo -e "${GREEN}放行端口 ${port}/${proto} 成功${PLAIN}" >&2
+        echo -e "${GREEN}[完成] 放行端口 ${port}/${proto} 成功${PLAIN}" >&2
     elif [ "$fw_found" -eq 0 ]; then
-        echo -e "${YELLOW}未检测到系统内置防火墙工具，请确保云服务商后台和本机系统放行了 ${port} 端口！${PLAIN}" >&2
+        echo -e "${YELLOW}[提示] 未检测到系统内置防火墙工具，请确保云服务商后台和本机系统放行了 ${port} 端口！${PLAIN}" >&2
     else
         printf '放行端口 %s/%s 失败。\n' "$port" "$proto" >&2
         return 1
@@ -705,7 +689,7 @@ ensure_deps() {
     done
     [ ${#miss[@]} -eq 0 ] && return 0
 
-    echo -e "${CYAN}==> 缺少依赖: ${miss[*]}，正在自动安装...${PLAIN}"
+    echo -e "${CYAN}[信息] ==> 缺少依赖: ${miss[*]}，正在自动安装...${PLAIN}"
     local pkgs=()
     for c in "${miss[@]}"; do
         case "$c" in
@@ -735,21 +719,21 @@ ensure_deps() {
         command -v "$c" >/dev/null 2>&1 || still+=("$c")
     done
     if [ ${#still[@]} -gt 0 ]; then
-        echo -e "${RED}以下依赖安装失败: ${still[*]}${PLAIN}"
-        echo -e "${YELLOW}请手动安装后重试。${PLAIN}"
+        echo -e "${RED}[错误] 以下依赖安装失败: ${still[*]}${PLAIN}"
+        echo -e "${YELLOW}[提示] 请手动安装后重试。${PLAIN}"
         return 1
     fi
-    echo -e "${GREEN}==> 依赖安装完毕。${PLAIN}"
+    echo -e "${GREEN}[完成] ==> 依赖安装完毕。${PLAIN}"
     return 0
 }
 
 init_base() {
-    ensure_deps curl wget jq tar openssl socat ss crontab flock || return 1
+    ensure_deps curl wget jq tar openssl socat ss crontab || return 1
 
     if [ "$OS_TYPE" == "alpine" ]; then
         if [ ! -e /lib/ld-linux-x86-64.so.2 ] && [ ! -e /lib64/ld-linux-x86-64.so.2 ] \
            && [ ! -e /lib/ld-linux-aarch64.so.1 ] && [ ! -e /lib64/ld-linux-aarch64.so.1 ]; then
-            echo -e "${CYAN}==> 正在安装 glibc 兼容层(sing-box 官方二进制需要)...${PLAIN}"
+            echo -e "${CYAN}[信息] ==> 正在安装 glibc 兼容层(sing-box 官方二进制需要)...${PLAIN}"
             run_step "安装兼容层" apk add libc6-compat gcompat || return 1
         fi
         rc-update add crond default >/dev/null 2>&1
@@ -759,15 +743,15 @@ init_base() {
     fi
 
     if ! kernel_ok; then
-        echo -e "${CYAN}==> 正在获取最新版 sing-box 内核信息...${PLAIN}"
+        echo -e "${CYAN}[信息] ==> 正在获取最新版 sing-box 内核信息...${PLAIN}"
         local VERSION
         VERSION=$(get_latest_version)
 
         if [ -z "$VERSION" ]; then
-            echo -e "${YELLOW}获取版本信息失败！${PLAIN}"
+            echo -e "${YELLOW}[提示] 获取版本信息失败！${PLAIN}"
             ask "请手动输入要安装的 sing-box 版本号 (例如 1.10.1): " VERSION
             if [ -z "$VERSION" ]; then
-                echo -e "${RED}未输入版本号，安装终止。${PLAIN}"
+                echo -e "${RED}[错误] 未输入版本号，安装终止。${PLAIN}"
                 return 1
             fi
         fi
@@ -779,16 +763,16 @@ init_base() {
     
     if [ -f "$CONFIG_FILE" ]; then
         if ! jq -e '.inbounds | type == "array"' "$CONFIG_FILE" >/dev/null 2>&1; then
-            echo -e "${RED}检测到 $CONFIG_FILE 已损坏（非法 JSON 或缺少 inbounds 数组）！${PLAIN}"
+            echo -e "${RED}[错误] 检测到 $CONFIG_FILE 已损坏（非法 JSON 或缺少 inbounds 数组）！${PLAIN}"
             ask "是否重建为空白配置？原文件会被备份，但现有节点将丢失。(y/n) [默认: n]: " rebuild
             if [[ "${rebuild:-n}" != "y" && "${rebuild:-n}" != "Y" ]]; then
-                echo -e "${YELLOW}已取消，未做任何修改。请手动修复该文件后再运行本脚本。${PLAIN}"
+                echo -e "${YELLOW}[提示] 已取消，未做任何修改。请手动修复该文件后再运行本脚本。${PLAIN}"
                 return 1
             fi
             local broken_bak
             broken_bak="${CONFIG_FILE}.broken.$(date +%Y%m%d%H%M%S)"
             if mv "$CONFIG_FILE" "$broken_bak" 2>/dev/null; then
-                echo -e "${YELLOW}原文件已备份为: ${broken_bak}${PLAIN}"
+                echo -e "${YELLOW}[提示] 原文件已备份为: ${broken_bak}${PLAIN}"
             fi
         fi
     fi
@@ -826,12 +810,12 @@ init_base() {
         local n
         n=$(jq '.inbounds | length' "$CONFIG_FILE" 2>/dev/null)
         if [ -n "$n" ] && [ "$n" -gt 0 ]; then
-            echo -e "${CYAN}==> 检测到已有节点，正在用新内核重启服务...${PLAIN}"
+            echo -e "${CYAN}[信息] ==> 检测到已有节点，正在用新内核重启服务...${PLAIN}"
             if restart_service; then
-                echo -e "${GREEN}==> 服务已恢复运行。${PLAIN}"
+                echo -e "${GREEN}[完成] ==> 服务已恢复运行。${PLAIN}"
             else
-                echo -e "${RED}==> 服务启动失败！请用 [6) 运行管理] 查看，或执行:${PLAIN}"
-                echo -e "${YELLOW}    sing-box check -c ${CONFIG_FILE}${PLAIN}"
+                echo -e "${RED}[错误] ==> 服务启动失败！请用 [6) 运行管理] 查看，或执行:${PLAIN}"
+                echo -e "${YELLOW}[提示]     sing-box check -c ${CONFIG_FILE}${PLAIN}"
             fi
         fi
     fi
@@ -928,9 +912,9 @@ get_domain() {
             break
         else
             if [ "$allow_colon" == "true" ]; then
-                echo -e "${RED}错误：格式不正确！必须包含字母或数字，且不得包含空格或特殊符号。${PLAIN}" >&2
+                echo -e "${RED}[错误] 错误：格式不正确！必须包含字母或数字，且不得包含空格或特殊符号。${PLAIN}" >&2
             else
-                echo -e "${RED}错误：格式不正确！纯域名不支持冒号，且必须包含字母或数字。${PLAIN}" >&2
+                echo -e "${RED}[错误] 错误：格式不正确！纯域名不支持冒号，且必须包含字母或数字。${PLAIN}" >&2
             fi
         fi
     done
@@ -1006,7 +990,7 @@ apply_real_cert() {
             fi
             if [ -n "$left_days" ] && [ "$left_days" -gt 7 ]; then
                 echo -e "\n${GREEN}检测到 ${NEW_DOMAIN} 已有有效证书，剩余 ${left_days} 天。${PLAIN}"
-                echo -e "${YELLOW}Let's Encrypt 对同一域名限制 168 小时内最多签发 5 次，建议直接复用。${PLAIN}"
+                echo -e "${YELLOW}[提示] Let's Encrypt 对同一域名限制 168 小时内最多签发 5 次，建议直接复用。${PLAIN}"
                 ask "是否复用现有证书？(y/n) [默认: y]: " ru
                 [[ "${ru:-y}" == "y" || "${ru:-y}" == "Y" ]] && reuse=1
             fi
@@ -1037,7 +1021,7 @@ apply_real_cert() {
         # Firewall access is maintained by the administrator for future renewals.
         # Never remove existing rules or create a temporary-only allowance here.
         if [ "$issue_ok" -eq 0 ]; then
-            echo -e "${RED}申请失败！请检查域名解析和 80 端口是否连通。${PLAIN}"
+            echo -e "${RED}[错误] 申请失败！请检查域名解析和 80 端口是否连通。${PLAIN}"
             return 1
         fi
     else
@@ -1045,25 +1029,25 @@ apply_real_cert() {
         while true; do
             ask "请输入 Cloudflare Global API Key: " NEW_CF_Key
             if [[ "$NEW_CF_Key" =~ ^[A-Za-z0-9]+$ ]]; then break; fi
-            echo -e "${RED}错误：API Key 格式不正确！${PLAIN}" >&2
+            echo -e "${RED}[错误] 错误：API Key 格式不正确！${PLAIN}" >&2
         done
         
         local NEW_CF_Email=""
         while true; do
             ask "请输入 Cloudflare 邮箱: " NEW_CF_Email
             if [[ "$NEW_CF_Email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then break; fi
-            echo -e "${RED}错误：邮箱格式不正确，请重新输入！${PLAIN}" >&2
+            echo -e "${RED}[错误] 错误：邮箱格式不正确，请重新输入！${PLAIN}" >&2
         done
         
         if ! CF_Key="${NEW_CF_Key}" CF_Email="${NEW_CF_Email}" ~/.acme.sh/acme.sh --issue --dns dns_cf -d "${NEW_DOMAIN}" --force; then
-            echo -e "${RED}申请失败！请检查 CF API 是否正确，或该域名已达 Let's Encrypt 签发频率上限。${PLAIN}"
+            echo -e "${RED}[错误] 申请失败！请检查 CF API 是否正确，或该域名已达 Let's Encrypt 签发频率上限。${PLAIN}"
             return 1
         fi
     fi
     fi
     
     deploy_real_cert "$NEW_DOMAIN" "$had_prior" || return 1
-    echo -e "${GREEN}域名证书申请并安装完成！${PLAIN}"
+    echo -e "${GREEN}[完成] 域名证书申请并安装完成！${PLAIN}"
     return 0
 }
 
@@ -1130,7 +1114,7 @@ deploy_real_cert() {
         if ! "$HOME/.acme.sh/acme.sh" --installcert -d "$domain" \
             --fullchainpath "$CERT_DIR/real.cer" --keypath "$CERT_DIR/real.key" \
             --reloadcmd "$reload"; then
-            echo -e "${RED}证书部署命令失败，未完成安装。${PLAIN}" >&2
+            echo -e "${RED}[错误] 证书部署命令失败，未完成安装。${PLAIN}" >&2
             exit 1
         fi
         openssl x509 -in "$CERT_DIR/real.cer" -noout -checkend 0 >/dev/null &&
@@ -1151,7 +1135,7 @@ generate_self_cert() {
     ensure_deps openssl || return 1
     local NEW_DOMAIN
     NEW_DOMAIN=$(get_domain "请输入伪装域名" "bing.com") || exit 1
-    echo -e "${CYAN}正在生成自签证书...${PLAIN}"
+    echo -e "${CYAN}[信息] 正在生成自签证书...${PLAIN}"
     (
         umask 077
         local stage changed=0 completed=0
@@ -1194,7 +1178,7 @@ generate_self_cert() {
         if ! openssl req -x509 -nodes -days 36500 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
             -keyout "$stage/new.key" -out "$stage/new.cer" -subj "/CN=${NEW_DOMAIN}" \
             -addext "subjectAltName=DNS:${NEW_DOMAIN}"; then
-            echo -e "${RED}生成自签证书失败！请查看上方报错信息。${PLAIN}" >&2
+            echo -e "${RED}[错误] 生成自签证书失败！请查看上方报错信息。${PLAIN}" >&2
             exit 1
         fi
         openssl x509 -in "$stage/new.cer" -noout -checkend 0 >/dev/null &&
@@ -1208,13 +1192,13 @@ generate_self_cert() {
         mv -f "$stage/new.cer" "$CERT_DIR/self.cer" &&
         save_secret SELF_DOMAIN "$NEW_DOMAIN" || exit 1
         completed=1
-        echo -e "${GREEN}自签证书生成完毕！${PLAIN}"
+        echo -e "${GREEN}[完成] 自签证书生成完毕！${PLAIN}"
     )
 }
 
 cert_manage() {
     while true; do
-        clear
+        ui_clear
         echo -e "选择: 证书管理\n"
         echo -e " 1) 重新申请域名证书"
         echo -e " 2) 重新生成自签证书"
@@ -1233,25 +1217,25 @@ cert_manage() {
                     echo -e "绑定的域名\t: ${GREEN}${REAL_DOMAIN}${PLAIN}"
                     echo -e "证书路径\t: ${GREEN}$CERT_DIR/real.cer${PLAIN}"
                     if crontab -l 2>/dev/null | grep -q "acme.sh"; then
-                        echo -e "${YELLOW}检测到 acme.sh 定时任务；尚未验证 cron 服务、此域名的续期记录及最近执行结果。${PLAIN}"
+                        echo -e "${YELLOW}[提示] 检测到 acme.sh 定时任务；尚未验证 cron 服务、此域名的续期记录及最近执行结果。${PLAIN}"
                     else
-                        echo -e "${RED}警告: 未发现自动续期任务！${PLAIN}"
+                        echo -e "${RED}[错误] 警告: 未发现自动续期任务！${PLAIN}"
                     fi
                 else
-                    echo -e "${YELLOW}当前未安装域名证书。${PLAIN}"
+                    echo -e "${YELLOW}[提示] 当前未安装域名证书。${PLAIN}"
                 fi
                 echo -e "\n------------- 自签证书 -------------"
                 if [ -s "$CERT_DIR/self.cer" ]; then
                     echo -e "伪装域名\t: ${GREEN}${SELF_DOMAIN}${PLAIN}"
                     echo -e "证书路径\t: ${GREEN}$CERT_DIR/self.cer${PLAIN}"
                 else
-                    echo -e "${YELLOW}当前未生成自签证书。${PLAIN}"
+                    echo -e "${YELLOW}[提示] 当前未生成自签证书。${PLAIN}"
                 fi
                 echo -e "------------------------------------"
                 pause
                 ;;
             0) return ;;
-            *) echo -e "${RED}输入错误，请重新选择!${PLAIN}"; sleep 1 ;;
+            *) echo -e "${RED}[错误] 输入错误，请重新选择!${PLAIN}"; sleep 1 ;;
         esac
     done
 }
@@ -1266,7 +1250,7 @@ prompt_cert_type() {
         case "$c_idx" in
             1)
                 if [ ! -s "$CERT_DIR/real.cer" ] || [ ! -s "$CERT_DIR/real.key" ]; then
-                    echo -e "${YELLOW}未检测到有效域名证书，需要先申请...${PLAIN}"
+                    echo -e "${YELLOW}[提示] 未检测到有效域名证书，需要先申请...${PLAIN}"
                     if ! apply_real_cert; then return 1; fi
                 fi
                 SEL_CERT="$CERT_DIR/real.cer"
@@ -1274,13 +1258,13 @@ prompt_cert_type() {
                 break ;;
             2)
                 if [ ! -s "$CERT_DIR/self.cer" ] || [ ! -s "$CERT_DIR/self.key" ]; then
-                    echo -e "${YELLOW}未检测到有效自签证书，需要先生成...${PLAIN}"
+                    echo -e "${YELLOW}[提示] 未检测到有效自签证书，需要先生成...${PLAIN}"
                     if ! generate_self_cert; then return 1; fi
                 fi
                 SEL_CERT="$CERT_DIR/self.cer"
                 SEL_KEY="$CERT_DIR/self.key"
                 break ;;
-            *) echo -e "${RED}输入错误！${PLAIN}" ;;
+            *) echo -e "${RED}[错误] 输入错误！${PLAIN}" ;;
         esac
     done
     return 0
@@ -1294,7 +1278,7 @@ get_uuid() {
         if [[ "$val" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
             break
         else
-            echo -e "${RED}错误：输入的格式不规范！必须是标准 UUIDv4 格式。${PLAIN}" >&2
+            echo -e "${RED}[错误] 错误：输入的格式不规范！必须是标准 UUIDv4 格式。${PLAIN}" >&2
         fi
     done
     echo -e "UUID: ${GREEN}${val}${PLAIN}" >&2
@@ -1309,7 +1293,7 @@ get_pass() {
         if [[ "$val" =~ [^[:space:]] ]]; then
             break
         else
-            echo -e "${RED}错误：密码不能全为空白字符！${PLAIN}" >&2
+            echo -e "${RED}[错误] 错误：密码不能全为空白字符！${PLAIN}" >&2
         fi
     done
     printf '密码: %b%s%b\n' "$GREEN" "$val" "$PLAIN" >&2
@@ -1322,7 +1306,7 @@ get_ss_method() {
     for i in "${!METHODS[@]}"; do
         echo -e " $((i + 1))) ${METHODS[$i]}" >&2
     done
-    echo -e "${YELLOW}提示: 4/5/6 为 SIP022 (2022) 方法，密码将自动生成 base64 密钥${PLAIN}" >&2
+    echo -e "${YELLOW}[提示] 提示: 4/5/6 为 SIP022 (2022) 方法，密码将自动生成 base64 密钥${PLAIN}" >&2
     local idx
     while true; do
         ask "请选择 [1-${#METHODS[@]}] [默认: 1]: " idx
@@ -1331,7 +1315,7 @@ get_ss_method() {
             echo "${METHODS[$((idx - 1))]}"
             return
         fi
-        echo -e "${RED}输入错误，请重新选择！${PLAIN}" >&2
+        echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}" >&2
     done
 }
 
@@ -1409,7 +1393,7 @@ build_share_url() {
 
     local -a M
     mapfile -t M < <(node_read "$TAG")
-    [ "${#M[@]}" -lt 9 ] && { echo -e "${RED}[读取节点 $TAG 失败]${PLAIN}"; return; }
+    [ "${#M[@]}" -lt 9 ] && { echo -e "${RED}[错误] [读取节点 $TAG 失败]${PLAIN}"; return; }
     local TYPE=${M[0]} PORT=${M[1]} CERT_PATH=${M[2]}
     local N_UUID=${M[3]} N_PASS=${M[4]} SNI=${M[5]} SID=${M[6]}
     local IS_REALITY=${M[7]} IS_WS=${M[8]} SS_METHOD=${M[9]}
@@ -1425,7 +1409,7 @@ build_share_url() {
     case "$TYPE" in
         vless)
             if [ "$IS_REALITY" == "1" ]; then
-                if [ -z "$IP" ]; then echo -e "${RED}[获取公网IP异常，无法生成 VLESS-REALITY 链接]${PLAIN}"; return; fi
+                if [ -z "$IP" ]; then echo -e "${RED}[错误] [获取公网IP异常，无法生成 VLESS-REALITY 链接]${PLAIN}"; return; fi
                 local var_name="REALITY_PUB_${PORT}"
                 local PUB="${!var_name}"
                 echo "vless://${N_UUID}@${IP_URI}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
@@ -1434,20 +1418,20 @@ build_share_url() {
                 local var_dom="ARGO_DOMAIN_${PORT}"
                 local A_IP="${!var_ip}"
                 local A_DOM="${!var_dom}"
-                if [ -z "$A_IP" ]; then echo -e "${RED}[无法读取 Argo IP，无法生成链接]${PLAIN}"; return; fi
+                if [ -z "$A_IP" ]; then echo -e "${RED}[错误] [无法读取 Argo IP，无法生成链接]${PLAIN}"; return; fi
                 local A_IP_URI
                 A_IP_URI=$(wrap_ipv6 "$A_IP")
                 echo "vless://${N_UUID}@${A_IP_URI}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
             fi
             ;;
         hysteria2)
-            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[获取连接地址失败，无法生成 Hysteria2 链接]${PLAIN}"; return; fi
+            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Hysteria2 链接]${PLAIN}"; return; fi
             local AUTH_ENC
             AUTH_ENC=$(url_encode "$N_PASS")
             echo "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
         tuic)
-            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[获取连接地址失败，无法生成 TUIC 链接]${PLAIN}"; return; fi
+            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 TUIC 链接]${PLAIN}"; return; fi
             local T_UUID_ENC
             T_UUID_ENC=$(url_encode "$N_UUID")
             local T_PASS_ENC
@@ -1455,13 +1439,13 @@ build_share_url() {
             echo "tuic://${T_UUID_ENC}:${T_PASS_ENC}@${CONN_ADDR_URI}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
         anytls)
-            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[获取连接地址失败，无法生成 AnyTLS 链接]${PLAIN}"; return; fi
+            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 AnyTLS 链接]${PLAIN}"; return; fi
             local AUTH_ENC
             AUTH_ENC=$(url_encode "$N_PASS")
             echo "anytls://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
         shadowsocks)
-            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[获取连接地址失败，无法生成 Shadowsocks 链接]${PLAIN}"; return; fi
+            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Shadowsocks 链接]${PLAIN}"; return; fi
             local SS_CRED
             if [[ "$SS_METHOD" == 2022-* ]]; then
                 SS_CRED="$(url_encode "$SS_METHOD"):$(url_encode "$N_PASS")"
@@ -1481,7 +1465,7 @@ print_config_detail() {
 
     local -a M
     mapfile -t M < <(node_read "$TAG")
-    [ "${#M[@]}" -lt 9 ] && { echo -e "${RED}[读取节点 $TAG 失败]${PLAIN}"; return; }
+    [ "${#M[@]}" -lt 9 ] && { echo -e "${RED}[错误] [读取节点 $TAG 失败]${PLAIN}"; return; }
     local TYPE=${M[0]} PORT=${M[1]} CERT_PATH=${M[2]}
     local N_UUID=${M[3]} N_PASS=${M[4]} SNI=${M[5]} SID=${M[6]}
     local IS_REALITY=${M[7]} IS_WS=${M[8]} SS_METHOD=${M[9]}
@@ -1586,7 +1570,7 @@ select_inbound() {
     IFS=$old_IFS
     
     if [ ${#TAGS[@]} -eq 0 ]; then
-        echo -e "${RED}未添加节点配置！${PLAIN}"
+        echo -e "${RED}[错误] 未添加节点配置！${PLAIN}"
         pause
         return 1
     fi
@@ -1599,7 +1583,7 @@ select_inbound() {
         ask "请选择 [0-${#TAGS[@]}]: " idx
         if [[ -z "$idx" ]] || [[ "$idx" == "0" ]]; then return 1; fi
         if ! [[ "$idx" =~ ^[1-9][0-9]*$ ]] || [ "$idx" -gt "${#TAGS[@]}" ]; then 
-            echo -e "${RED}输入错误，请重新选择！${PLAIN}"
+            echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}"
             continue
         fi
         ((idx--))
@@ -1632,8 +1616,8 @@ warn_port_shared() {
         esac
         if [ -n "$o_proto" ] && [ "$o_proto" != "$proto" ]; then
             echo -e "\n${YELLOW}提示: 端口 ${port} 已被节点 ${o_tag} 使用 (${o_proto^^})，本节点用的是 ${proto^^}。${PLAIN}"
-            echo -e "${YELLOW}内核允许 TCP/UDP 同号共存，但请确认防火墙与云服务商/NAT 端口映射${PLAIN}"
-            echo -e "${YELLOW}对 ${proto^^} 和 ${o_proto^^} 两种协议都放行了 ${port}，否则其中一个节点会连不上。${PLAIN}"
+            echo -e "${YELLOW}[提示] 内核允许 TCP/UDP 同号共存，但请确认防火墙与云服务商/NAT 端口映射${PLAIN}"
+            echo -e "${YELLOW}[提示] 对 ${proto^^} 和 ${o_proto^^} 两种协议都放行了 ${port}，否则其中一个节点会连不上。${PLAIN}"
             found=0
         fi
     done <<< "$other"
@@ -1642,7 +1626,7 @@ warn_port_shared() {
 
 add_config() {
     while true; do
-        clear
+        ui_clear
         echo -e "请选择协议:\n"
         echo -e " 1) VLESS-REALITY"
         echo -e " 2) Hysteria2"
@@ -1656,7 +1640,7 @@ add_config() {
         while true; do
             ask "请选择 [0-6]: " proto_idx
             if [[ "$proto_idx" =~ ^[0-6]$ ]]; then break; fi
-            echo -e "${RED}输入错误，请重新选择！${PLAIN}"
+            echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}"
         done
         [ "$proto_idx" == "0" ] && return
 
@@ -1675,10 +1659,10 @@ add_config() {
             ask "请输入监听端口 [默认: $DEF_PORT]: " PORT
             PORT=${PORT:-$DEF_PORT}
             if ! [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-                echo -e "${RED}端口必须为 1-65535 之间的数字${PLAIN}"; continue
+                echo -e "${RED}[错误] 端口必须为 1-65535 之间的数字${PLAIN}"; continue
             fi
             if check_port "$PORT" "$f_proto"; then
-                echo -e "${RED}错误! 端口 ${PORT} 已被占用！${PLAIN}"; continue
+                echo -e "${RED}[错误] 错误! 端口 ${PORT} 已被占用！${PLAIN}"; continue
             fi
             break
         done
@@ -1710,7 +1694,7 @@ add_config() {
             if [[ "$input_tag" =~ ^[a-zA-Z0-9_-]+$ ]]; then
                 break
             else
-                echo -e "${RED}错误：节点名称仅限字母、数字、短横线和下划线！${PLAIN}" >&2
+                echo -e "${RED}[错误] 错误：节点名称仅限字母、数字、短横线和下划线！${PLAIN}" >&2
             fi
         done
         local TAG
@@ -1790,7 +1774,7 @@ add_config() {
                 while true; do
                     ask "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN
                     if [[ "$ARGO_TOKEN" =~ ^[A-Za-z0-9+/=._-]+$ ]]; then break; fi
-                    echo -e "${RED}错误：Token 格式不正确或为空！${PLAIN}" >&2
+                    echo -e "${RED}[错误] 错误：Token 格式不正确或为空！${PLAIN}" >&2
                 done
                 
                 save_secret "ARGO_IP_${PORT}" "$ARGO_IP" || { restore_config_and_service || return 1; return 1; }
@@ -1800,24 +1784,35 @@ add_config() {
                 --argjson p "$PORT" --arg uuid "$UUID" --arg tag "$TAG"; then
                     jq_ok=0
                 else
-                    local CF_FAILED=0 CF_BIN
+                    local CF_FAILED=0 CF_BIN CF_NEW=0
                     CF_BIN=$(type -P cloudflared) || CF_BIN=""
+                    if [ -z "$CF_BIN" ] && { [ -e /usr/local/bin/cloudflared ] || [ -L /usr/local/bin/cloudflared ]; }; then
+                        echo '[提示] cloudflared 目标路径已有文件，拒绝覆盖。' >&2
+                        CF_BIN=/usr/local/bin/cloudflared
+                        CF_FAILED=1
+                    fi
                     if [ -z "$CF_BIN" ]; then
                         CF_BIN=/usr/local/bin/cloudflared
-                        echo -e "${CYAN}正在下载 cloudflared 组件...${PLAIN}"
+                        echo -e "${CYAN}[信息] 正在下载 cloudflared 组件...${PLAIN}"
                         local TMP_CF
-                        TMP_CF=$(mktemp)
+                        TMP_CF=$(mktemp) || { restore_config_and_service; return 1; }
                         local cf_arch="amd64"
                         [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && cf_arch="arm64"
-                        if fetch_url "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" "$TMP_CF"; then
+                        if run_step "下载 cloudflared" fetch_url "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" "$TMP_CF"; then
                             if ! chmod 755 "$TMP_CF" ||
                                ! chown 0:0 "$TMP_CF" ||
-                               ! mv "$TMP_CF" /usr/local/bin/cloudflared; then
+                               ! mv -n "$TMP_CF" /usr/local/bin/cloudflared; then
                                 rm -f "$TMP_CF"
                                 CF_FAILED=1
+                            elif [ -e "$TMP_CF" ]; then
+                                # Destination appeared concurrently; never claim it.
+                                rm -f "$TMP_CF"
+                                CF_FAILED=1
+                            else
+                                CF_NEW=1
                             fi
                         else
-                            echo -e "${RED}下载 cloudflared 失败！${PLAIN}"
+                            echo -e "${RED}[错误] 下载 cloudflared 失败！${PLAIN}"
                             rm -f "$TMP_CF"
                             CF_FAILED=1
                         fi
@@ -1832,6 +1827,12 @@ add_config() {
                     elif [ "$CF_FAILED" = 0 ] && ! "$CF_BIN" --version >/dev/null 2>&1; then
                         echo 'cloudflared 无法运行，拒绝创建服务。' >&2
                         CF_FAILED=1
+                    fi
+                    if [ "$CF_FAILED" = 0 ] && [ "$CF_NEW" = 1 ]; then
+                        if ! record_cloudflared_owner "$CF_BIN"; then
+                            echo '[提示] 安装归属登记失败，组件将按非受管文件保留。' >&2
+                            CF_FAILED=1
+                        fi
                     fi
                     if [ "$CF_FAILED" = 0 ]; then
                         CONFIG_TX_ARGO_PENDING="$TAG"
@@ -1885,8 +1886,8 @@ EOF
                         systemctl is-active --quiet "cloudflared-${TAG}" &&
                         register_argo_service "cloudflared-${TAG}" || CF_FAILED=1
                     else
-                        echo -e "${RED}cloudflared 检查失败，本次节点将回滚。${PLAIN}"
-                        echo -e "${YELLOW}请检查组件下载、可执行路径及运行环境后重试。${PLAIN}"
+                        echo -e "${RED}[错误] cloudflared 检查失败，本次节点将回滚。${PLAIN}"
+                        echo -e "${YELLOW}[提示] 请检查组件下载、可执行路径及运行环境后重试。${PLAIN}"
                     fi
                     if [ "$CF_FAILED" -ne 0 ]; then
                         # Preserve metadata and backup when service cleanup fails.
@@ -1911,7 +1912,7 @@ EOF
                     ask "请输入SS密码 [默认按方法自动生成]: " PASS
                     PASS=${PASS:-$SS_DEFAULT_PASS}
                     if get_ss_pass_valid "$SS_METHOD" "$PASS"; then break; fi
-                    echo -e "${RED}错误：$SS_METHOD 要求 base64 密钥且长度精确(16/32字节)，请重新输入！${PLAIN}" >&2
+                    echo -e "${RED}[错误] 错误：$SS_METHOD 要求 base64 密钥且长度精确(16/32字节)，请重新输入！${PLAIN}" >&2
                 done
                 apply_jq_config '.inbounds += [{"type":"shadowsocks","tag":$tag,"listen":"::","listen_port":$p,"method":$m,"password":$pass}]' \
                 --argjson p "$PORT" --arg m "$SS_METHOD" --arg pass "$PASS" --arg tag "$TAG" || jq_ok=0
@@ -1955,12 +1956,12 @@ EOF
 
 modify_config() {
     while true; do
-        clear
+        ui_clear
         echo -e "选择: 更改节点\n"
         select_inbound || return
 
         while true; do
-            clear
+            ui_clear
             local TYPE
             TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' "$CONFIG_FILE")
             local OLD_PORT
@@ -1998,7 +1999,7 @@ modify_config() {
                             3) action="tag"; break ;; 
                             4) [ "$IS_REALITY" -eq 1 ] && action="sni" || action="argo_ip"; break ;; 
                             0) break ;; 
-                            *) echo -e "${RED}错误!${PLAIN}" ;; 
+                            *) echo -e "${RED}[错误] 错误!${PLAIN}" ;; 
                         esac
                     else
                     local mod_idx
@@ -2008,7 +2009,7 @@ modify_config() {
                             2) action="port"; break ;; 
                             3) action="tag"; break ;; 
                             0) break ;; 
-                            *) echo -e "${RED}错误!${PLAIN}" ;; 
+                            *) echo -e "${RED}[错误] 错误!${PLAIN}" ;; 
                         esac
                     fi
                 done
@@ -2024,13 +2025,13 @@ modify_config() {
                         1) action="pass"; break ;; 
                         2) action="port"; break ;; 
                         3) action="tag"; break ;; 
-                        4) if [ "$TYPE" != "shadowsocks" ]; then action="cert"; break; else echo -e "${RED}错误!${PLAIN}"; fi ;; 
+                        4) if [ "$TYPE" != "shadowsocks" ]; then action="cert"; break; else echo -e "${RED}[错误] 错误!${PLAIN}"; fi ;; 
                         0) break ;; 
-                        *) echo -e "${RED}错误!${PLAIN}" ;; 
+                        *) echo -e "${RED}[错误] 错误!${PLAIN}" ;; 
                     esac
                 done
             else
-                echo -e "${RED}不支持修改的协议类型${PLAIN}"
+                echo -e "${RED}[错误] 不支持修改的协议类型${PLAIN}"
                 pause
                 break
             fi
@@ -2041,7 +2042,7 @@ modify_config() {
                 local NEW_ARGO_IP
                 NEW_ARGO_IP=$(get_domain "请输入新的 Argo 优选域名/IP" "saas.sin.fan" "true") || exit 1
                 save_secret "ARGO_IP_${OLD_PORT}" "$NEW_ARGO_IP" || return 1
-                echo -e "${GREEN}优选域名/IP 已成功更改为: $NEW_ARGO_IP${PLAIN}"
+                echo -e "${GREEN}[完成] 优选域名/IP 已成功更改为: $NEW_ARGO_IP${PLAIN}"
                 pause
                 continue
             fi
@@ -2066,7 +2067,7 @@ modify_config() {
                         ask "请输入新SS密码 [默认按方法自动生成]: " NEW_AUTH
                         NEW_AUTH=${NEW_AUTH:-$SS_DEFAULT_PASS}
                         if get_ss_pass_valid "$SS_METHOD_CUR" "$NEW_AUTH"; then break; fi
-                        echo -e "${RED}错误：$SS_METHOD_CUR 要求 base64 密钥且长度精确(16/32字节)，请重新输入！${PLAIN}" >&2
+                        echo -e "${RED}[错误] 错误：$SS_METHOD_CUR 要求 base64 密钥且长度精确(16/32字节)，请重新输入！${PLAIN}" >&2
                     done
                 else
                     NEW_AUTH=$(get_pass) || exit 1
@@ -2089,9 +2090,9 @@ modify_config() {
                 fi
                 
                 if ! restart_service; then 
-                    echo -e "${RED}操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
                 else
-                    echo -e "${GREEN}节点秘钥已更新！${PLAIN}"; commit_config || return 1
+                    echo -e "${GREEN}[完成] 节点秘钥已更新！${PLAIN}"; commit_config || return 1
                 fi
                 pause
                 
@@ -2106,9 +2107,9 @@ modify_config() {
                     fi
                     
                     if ! restart_service; then 
-                        echo -e "${RED}操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
+                        echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
                     else
-                        echo -e "${GREEN}节点 $TAG 的证书已更新！${PLAIN}"; commit_config || return 1
+                        echo -e "${GREEN}[完成] 节点 $TAG 的证书已更新！${PLAIN}"; commit_config || return 1
                     fi
                 else
                     commit_config || return 1
@@ -2126,13 +2127,13 @@ modify_config() {
 
                 if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
                     echo -e "\n${YELLOW}注意: 这是 Argo 节点，入口由 Cloudflare Tunnel 提供。${PLAIN}"
-                    echo -e "${YELLOW}改完本地端口后，必须去 Cloudflare Zero Trust 后台把该 Tunnel 的${PLAIN}"
-                    echo -e "${YELLOW}Public Hostname (Ingress) 目标同步改成 localhost:<新端口>，${PLAIN}"
-                    echo -e "${YELLOW}否则节点会立即失效(隧道返回 502)。${PLAIN}"
+                    echo -e "${YELLOW}[提示] 改完本地端口后，必须去 Cloudflare Zero Trust 后台把该 Tunnel 的${PLAIN}"
+                    echo -e "${YELLOW}[提示] Public Hostname (Ingress) 目标同步改成 localhost:<新端口>，${PLAIN}"
+                    echo -e "${YELLOW}[提示] 否则节点会立即失效(隧道返回 502)。${PLAIN}"
                     ask "确认继续修改端口？(y/n) [默认: n]: " argo_go
                     if [[ "${argo_go:-n}" != "y" && "${argo_go:-n}" != "Y" ]]; then
                         commit_config || return 1
-                        echo -e "${CYAN}已取消。${PLAIN}"
+                        echo -e "${CYAN}[信息] 已取消。${PLAIN}"
                         pause
                         continue
                     fi
@@ -2142,8 +2143,8 @@ modify_config() {
                 while true; do
                     ask "请输入新端口 [默认随机]: " NEW_PORT
                     NEW_PORT=${NEW_PORT:-$(rand_port)}
-                    if ! [[ "$NEW_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then echo -e "${RED}错误输入!${PLAIN}"; continue; fi
-                    if [ "$NEW_PORT" != "$OLD_PORT" ] && check_port "$NEW_PORT" "$f_proto"; then echo -e "${RED}端口占用!${PLAIN}"; continue; fi
+                    if ! [[ "$NEW_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then echo -e "${RED}[错误] 错误输入!${PLAIN}"; continue; fi
+                    if [ "$NEW_PORT" != "$OLD_PORT" ] && check_port "$NEW_PORT" "$f_proto"; then echo -e "${RED}[错误] 端口占用!${PLAIN}"; continue; fi
                     break
                 done
                 warn_port_shared "$NEW_PORT" "$f_proto" "$TAG"
@@ -2187,12 +2188,12 @@ modify_config() {
                     cleanup_node_secrets "$OLD_PORT" "$SEC_TYPE" "$IS_ARGO" || { restore_config_and_service || return 1; return 1; }
                 fi
                 if ! restart_service; then 
-                    echo -e "${RED}操作失败，已还原配置！${PLAIN}"
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
                     restore_config_and_service || return 1
                 else
                     commit_config || return 1
                     
-                    echo -e "${GREEN}端口已更改为: $NEW_PORT${PLAIN}"
+                    echo -e "${GREEN}[完成] 端口已更改为: $NEW_PORT${PLAIN}"
                     
                     if [ -n "$f_proto" ] && [ "$OLD_PORT" != "$NEW_PORT" ]; then
                         if close_fw_port "$OLD_PORT" "$f_proto"; then
@@ -2215,9 +2216,9 @@ modify_config() {
                 while true; do
                     ask "请输入新的节点名称: " NEW_TAG
                     NEW_TAG=${NEW_TAG// /-}
-                    if [ -z "$NEW_TAG" ]; then echo -e "${RED}不能为空!${PLAIN}"; continue; fi
-                    if ! [[ "$NEW_TAG" =~ ^[a-zA-Z0-9_-]+$ ]]; then echo -e "${RED}错误：节点名称仅限字母、数字、短横线和下划线！${PLAIN}"; continue; fi
-                    if jq -e --arg tag "$NEW_TAG" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then echo -e "${RED}名称已存在！${PLAIN}"; continue; fi
+                    if [ -z "$NEW_TAG" ]; then echo -e "${RED}[错误] 不能为空!${PLAIN}"; continue; fi
+                    if ! [[ "$NEW_TAG" =~ ^[a-zA-Z0-9_-]+$ ]]; then echo -e "${RED}[错误] 错误：节点名称仅限字母、数字、短横线和下划线！${PLAIN}"; continue; fi
+                    if jq -e --arg tag "$NEW_TAG" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then echo -e "${RED}[错误] 名称已存在！${PLAIN}"; continue; fi
                     break
                 done
                 
@@ -2232,7 +2233,7 @@ modify_config() {
                 fi
                 
                 if ! restart_service; then 
-                    echo -e "${RED}操作失败，已还原配置！${PLAIN}"
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
                     restore_config_and_service || return 1
                 else
                     if [ "$IS_ARGO" -eq 1 ]; then
@@ -2242,7 +2243,7 @@ modify_config() {
                             return 1
                         fi
                     fi
-                    echo -e "${GREEN}节点名称已成功更改为: $NEW_TAG${PLAIN}"
+                    echo -e "${GREEN}[完成] 节点名称已成功更改为: $NEW_TAG${PLAIN}"
                     commit_config || return 1
                     TAG="$NEW_TAG"
                 fi
@@ -2260,10 +2261,10 @@ modify_config() {
                 fi
                 
                 if ! restart_service; then 
-                    echo -e "${RED}操作失败，已还原配置！${PLAIN}"
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
                     restore_config_and_service || return 1
                 else
-                    echo -e "${GREEN}伪装域名已成功更改为: $NEW_SNI${PLAIN}"
+                    echo -e "${GREEN}[完成] 伪装域名已成功更改为: $NEW_SNI${PLAIN}"
                     commit_config || return 1
                 fi
                 pause
@@ -2274,7 +2275,7 @@ modify_config() {
 
 del_config() {
     while true; do
-        clear
+        ui_clear
         echo -e "选择: 删除节点\n"
         select_inbound || return
         
@@ -2299,7 +2300,7 @@ del_config() {
             return 1
         fi
         if ! restart_service; then
-            echo -e "${RED}删除失败：配置还原，内核未能正常重启！${PLAIN}"
+            echo -e "${RED}[错误] 删除失败：配置还原，内核未能正常重启！${PLAIN}"
             restore_config_and_service || return 1
             pause
             continue
@@ -2339,9 +2340,9 @@ del_config() {
         local INBOUND_COUNT
         INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
         if [ "$INBOUND_COUNT" -eq 0 ]; then
-            echo -e "${GREEN}配置 $TAG 已删除！检测到已无节点，内核已自动停止。${PLAIN}"
+            echo -e "${GREEN}[完成] 配置 $TAG 已删除！检测到已无节点，内核已自动停止。${PLAIN}"
         else
-            echo -e "${GREEN}配置 $TAG 已删除！${PLAIN}"
+            echo -e "${GREEN}[完成] 配置 $TAG 已删除！${PLAIN}"
         fi
         pause
     done
@@ -2349,7 +2350,7 @@ del_config() {
 
 view_single_config() {
     while true; do
-        clear
+        ui_clear
         echo -e "选择: 单协议链接\n"
         select_inbound || return
         print_config_detail "$TAG"
@@ -2358,7 +2359,7 @@ view_single_config() {
 }
 
 show_all_links() {
-    clear
+    ui_clear
     echo -e "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     echo -e "🚀【 聚合节点 】节点信息如下：\n"
     
@@ -2368,7 +2369,7 @@ show_all_links() {
     IFS=$old_IFS
     
     if [ ${#TAGS[@]} -eq 0 ]; then
-        echo -e "${RED}未添加节点配置！${PLAIN}"
+        echo -e "${RED}[错误] 未添加节点配置！${PLAIN}"
     else
         IP=$(get_ip)
         for TAG in "${TAGS[@]}"; do build_share_url "$TAG" "$IP"; done
@@ -2379,7 +2380,7 @@ show_all_links() {
 
 view_config() {
     while true; do
-        clear
+        ui_clear
         echo -e "选择: 查看节点\n"
         echo -e " 1) 单协议链接"
         echo -e " 2) 聚合链接"
@@ -2387,7 +2388,7 @@ view_config() {
         while true; do
             local v_idx
             ask "请选择 [0-2]: " v_idx
-            case "$v_idx" in 1) view_single_config; break ;; 2) show_all_links; break ;; 0) return ;; *) echo -e "${RED}输入错误!${PLAIN}" ;; esac
+            case "$v_idx" in 1) view_single_config; break ;; 2) show_all_links; break ;; 0) return ;; *) echo -e "${RED}[错误] 输入错误!${PLAIN}" ;; esac
         done
     done
 }
@@ -2395,7 +2396,7 @@ view_config() {
 run_manage() {
     local run_idx=""
     while true; do
-        clear
+        ui_clear
         echo -e "选择: 运行管理\n"
         echo -e " 1) 启动"
         echo -e " 2) 停止"
@@ -2406,29 +2407,29 @@ run_manage() {
             case "$run_idx" in
                 1|3)
                    if [ "$run_idx" = 1 ] && service_is_active; then
-                       echo -e "${GREEN}服务已运行，无需重复启动。${PLAIN}"
+                       echo -e "${GREEN}[完成] 服务已运行，无需重复启动。${PLAIN}"
                        pause; break
                    fi
                    local INBOUND_COUNT
                    INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE 2>/dev/null)
-                   if [ -z "$INBOUND_COUNT" ] || [ "$INBOUND_COUNT" -eq 0 ]; then echo -e "${RED}未添加节点配置！${PLAIN}"; pause; break; fi
+                   if [ -z "$INBOUND_COUNT" ] || [ "$INBOUND_COUNT" -eq 0 ]; then echo -e "${RED}[错误] 未添加节点配置！${PLAIN}"; pause; break; fi
                    if ! restart_service; then
-                       echo -e "${RED}操作失败！内核启动失败，请检查配置。${PLAIN}"
+                       echo -e "${RED}[错误] 操作失败！内核启动失败，请检查配置。${PLAIN}"
                    else
-                       echo -e "${GREEN}已启动${PLAIN}"
+                       echo -e "${GREEN}[完成] 已启动${PLAIN}"
                    fi
                    pause; break ;;
                 2) 
                    local stop_rc=0
                    if [ "$OS_TYPE" == "alpine" ]; then rc-service sing-box stop || stop_rc=$?; else systemctl stop sing-box || stop_rc=$?; fi
                    if [ "$stop_rc" = 0 ]; then
-                       echo -e "${GREEN}已停止${PLAIN}"
+                       echo -e "${GREEN}[完成] 已停止${PLAIN}"
                    else
                        printf '%s\n' '停止服务失败，请检查服务状态。' >&2
                    fi
                    pause; break ;;
                 0) return ;;
-                *) echo -e "${RED}输入错误!${PLAIN}" ;;
+                *) echo -e "${RED}[错误] 输入错误!${PLAIN}" ;;
             esac
         done
     done
@@ -2436,8 +2437,8 @@ run_manage() {
 
 update_manage() {
     while true; do
-        clear
-        echo -e "${CYAN}正在检查更新，请稍候...${PLAIN}"
+        ui_clear
+        echo -e "${CYAN}[信息] 正在检查更新，请稍候...${PLAIN}"
         local CUR_VER="未安装"
         if kernel_ok; then
             local extracted_ver
@@ -2453,7 +2454,7 @@ update_manage() {
             fi
         fi
 
-        clear
+        ui_clear
         echo -e "选择: 更新\n"
         echo -e " 1) ${SB_UPDATE_TEXT}"
         echo -e " 2) 更新脚本"
@@ -2464,7 +2465,7 @@ update_manage() {
             ask "请选择 [0-3]: " up_idx
             case "$up_idx" in
                 1)
-                    if [ -z "$NEW_VER" ]; then echo -e "${RED}获取最新版本失败！API 受限或网络超时。${PLAIN}"; pause; break; fi
+                    if [ -z "$NEW_VER" ]; then echo -e "${RED}[错误] 获取最新版本失败！API 受限或网络超时。${PLAIN}"; pause; break; fi
                     if kernel_ok && [ "$CUR_VER" == "$NEW_VER" ]; then echo -e "\n${GREEN}当前已是最新，无需更新！${PLAIN}"; pause; break; fi
                     
                     echo -e "\n${YELLOW}即将更新内核至 v${NEW_VER}...${PLAIN}"
@@ -2473,19 +2474,19 @@ update_manage() {
                 2)
                     echo -e "\n${CYAN}正在拉取最新脚本代码...${PLAIN}"
                     if fetch_script "${BASH_SOURCE[0]}"; then
-                        echo -e "${GREEN}脚本代码更新成功！请重新运行 sb 命令。${PLAIN}"
+                        echo -e "${GREEN}[完成] 脚本代码更新成功！请重新运行 sb 命令。${PLAIN}"
                         exit 0
                     else
-                        echo -e "${RED}下载脚本失败或内容校验不通过！更新中止。${PLAIN}"
+                        echo -e "${RED}[错误] 下载脚本失败或内容校验不通过！更新中止。${PLAIN}"
                     fi
                     ;;
                 3)
                     if [ -z "$NEW_VER" ]; then
                         ask "获取最新版本失败，请手动输入要安装的版本号 (如 1.10.1): " NEW_VER
-                        [ -z "$NEW_VER" ] && { echo -e "${RED}未输入版本号，已取消。${PLAIN}"; pause; break; }
+                        [ -z "$NEW_VER" ] && { echo -e "${RED}[错误] 未输入版本号，已取消。${PLAIN}"; pause; break; }
                     fi
                     if ! [[ "$NEW_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                        echo -e "${RED}版本号格式错误(应为 x.y.z)，已取消。${PLAIN}"
+                        echo -e "${RED}[错误] 版本号格式错误(应为 x.y.z)，已取消。${PLAIN}"
                         pause; break
                     fi
                     echo -e "\n${YELLOW}将强制覆盖安装 v${NEW_VER}（无论当前版本是否相同）。${PLAIN}"
@@ -2493,22 +2494,22 @@ update_manage() {
                     if [[ "${fc:-y}" == "y" || "${fc:-y}" == "Y" ]]; then
                         install_kernel "$NEW_VER" restart
                     else
-                        echo -e "${YELLOW}已取消。${PLAIN}"
+                        echo -e "${YELLOW}[提示] 已取消。${PLAIN}"
                     fi
                     pause; break ;;
                 0) return ;;
-                *) echo -e "${RED}输入错误!${PLAIN}" ;;
+                *) echo -e "${RED}[错误] 输入错误!${PLAIN}" ;;
             esac
         done
     done
 }
 
 enable_bbr() {
-    echo -e "${CYAN}==> 尝试开启 BBR 加速...${PLAIN}"
+    echo -e "${CYAN}[信息] ==> 尝试开启 BBR 加速...${PLAIN}"
     local current_cc
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     if [ "$current_cc" == "bbr" ]; then
-        echo -e "${GREEN}当前系统已经开启了 BBR，无需重复配置！${PLAIN}"
+        echo -e "${GREEN}[完成] 当前系统已经开启了 BBR，无需重复配置！${PLAIN}"
         pause
         return
     fi
@@ -2527,7 +2528,7 @@ enable_bbr() {
                 grep -E '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' \
                     /etc/sysctl.conf > "$CONFIG_DIR/.sysctl_backup" 2>/dev/null
                 chmod 600 "$CONFIG_DIR/.sysctl_backup" 2>/dev/null
-                echo -e "${CYAN}已备份 /etc/sysctl.conf 中原有的 qdisc/拥塞控制设置。${PLAIN}"
+                echo -e "${CYAN}[信息] 已备份 /etc/sysctl.conf 中原有的 qdisc/拥塞控制设置。${PLAIN}"
             fi
         fi
     fi
@@ -2546,9 +2547,9 @@ EOF
     local new_cc
     new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     if [ "$new_cc" == "bbr" ]; then
-        echo -e "${GREEN}BBR 加速开启成功！配置已写入 /etc/sysctl.d/99-bbr.conf，重启后依然生效。${PLAIN}"
+        echo -e "${GREEN}[完成] BBR 加速开启成功！配置已写入 /etc/sysctl.d/99-bbr.conf，重启后依然生效。${PLAIN}"
     else
-        echo -e "${YELLOW}应用失败，当前系统内核可能不支持 BBR，或架构受限（如 OpenVZ/LXC 容器）无法修改内核参数。${PLAIN}"
+        echo -e "${YELLOW}[提示] 应用失败，当前系统内核可能不支持 BBR，或架构受限（如 OpenVZ/LXC 容器）无法修改内核参数。${PLAIN}"
     fi
     pause
 }
@@ -2556,7 +2557,7 @@ EOF
 config_outbound() {
     local out_idx=""
     while true; do
-        clear
+        ui_clear
         local current_strategy
         current_strategy=$(jq -r '.outbounds[] | select(.tag=="direct") | ((if (.domain_resolver | type) == "object" then .domain_resolver.strategy else null end) // .domain_strategy // "auto")' $CONFIG_FILE 2>/dev/null)
         echo -e "选择: 配置出站 IPv4/IPv6 策略"
@@ -2578,7 +2579,7 @@ config_outbound() {
             2) strategy="ipv6_only" ;;
             3) strategy="auto" ;;
             0) return ;;
-            *) echo -e "${RED}输入错误!${PLAIN}"; sleep 1; continue ;;
+            *) echo -e "${RED}[错误] 输入错误!${PLAIN}"; sleep 1; continue ;;
         esac
 
         local jq_success=0
@@ -2601,10 +2602,10 @@ config_outbound() {
         fi
         
         if ! restart_service; then
-            echo -e "${RED}操作失败(校验报错)，配置已还原！${PLAIN}"
+            echo -e "${RED}[错误] 操作失败(校验报错)，配置已还原！${PLAIN}"
             restore_config_and_service || return 1
         else
-            echo -e "${GREEN}出站策略已更新！${PLAIN}"
+            echo -e "${GREEN}[完成] 出站策略已更新！${PLAIN}"
             commit_config || return 1
         fi
         pause
@@ -2614,7 +2615,7 @@ config_outbound() {
 other_manage() {
     local om_idx=""
     while true; do
-        clear
+        ui_clear
         echo -e "选择: 其他\n"
         echo -e " 1) 开启 BBR 加速"
         echo -e " 2) 配置出站 IPv4/IPv6"
@@ -2624,7 +2625,7 @@ other_manage() {
             1) enable_bbr ;;
             2) config_outbound ;;
             0) return ;;
-            *) echo -e "${RED}输入错误!${PLAIN}"; sleep 1 ;;
+            *) echo -e "${RED}[错误] 输入错误!${PLAIN}"; sleep 1 ;;
         esac
     done
 }
@@ -2658,6 +2659,88 @@ stop_managed_service() {
         systemctl disable "$svc" || return 1
     fi
     return 0
+}
+
+
+# Ownership records contain data only; never source them as shell code.
+record_cloudflared_owner() {
+    local bin="$1" sum tmp
+    [ "$bin" = /usr/local/bin/cloudflared ] && [ -f "$bin" ] && [ ! -L "$bin" ] || return 1
+    sum=$(sha256sum "$bin") || return 1
+    sum=${sum%% *}
+    mkdir -p "$CONFIG_DIR" || return 1
+    tmp=$(mktemp "$CONFIG_DIR/.cloudflared-owner.XXXXXX") || return 1
+    if printf '%s\n' 'sing-box-manager-v1' "$bin" "$sum" > "$tmp" &&
+       chmod 600 "$tmp" && mv -f "$tmp" "$CONFIG_DIR/.cloudflared-owner"; then return 0; fi
+    rm -f "$tmp"
+    return 1
+}
+cloudflared_owner_valid() {
+    local record="$CONFIG_DIR/.cloudflared-owner" sum
+    local -a fields=()
+    [ -f "$record" ] && [ ! -L "$record" ] || return 1
+    mapfile -t fields < "$record" || return 1
+    [ "${#fields[@]}" = 3 ] || return 1
+    [ "${fields[0]}" = sing-box-manager-v1 ] || return 1
+    [ "${fields[1]}" = /usr/local/bin/cloudflared ] || return 1
+    [[ "${fields[2]}" =~ ^[a-f0-9]{64}$ ]] || return 1
+    [ -f "${fields[1]}" ] && [ ! -L "${fields[1]}" ] || return 1
+    sum=$(sha256sum "${fields[1]}") || return 1
+    [ "${sum%% *}" = "${fields[2]}" ]
+}
+cloudflared_unshared() {
+    local processes dir rc
+    processes=$(ps -A -o comm=) || return 1
+    if printf '%s\n' "$processes" | grep -q cloudflared; then return 1; fi
+    for dir in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system /etc/init.d /etc/cron.d; do
+        [ -d "$dir" ] || continue
+        grep -rIl -- cloudflared "$dir" >/dev/null 2>&1
+        rc=$?
+        [ "$rc" = 1 ] || return 1
+    done
+    for dir in /etc/cloudflared /usr/local/etc/cloudflared "$HOME/.cloudflared"; do
+        [ ! -e "$dir" ] || return 1
+    done
+    return 0
+}
+offer_cloudflared_removal() {
+    local reply
+    if ! cloudflared_owner_valid; then
+        if type -P cloudflared >/dev/null || [ -e /usr/local/bin/cloudflared ]; then
+            printf '[提示] cloudflared 无有效归属记录或文件已变更，已保留。\n'
+        fi
+        return 0
+    fi
+    if ! cloudflared_unshared; then
+        printf '[提示] cloudflared 疑似被共用或检查不完整，已保留。\n'
+        return 0
+    fi
+    ask "检测到本脚本安装的 cloudflared，是否一并删除？[y/N]: " reply
+    case "$reply" in
+        y|Y)
+            # Recheck after the prompt, before deletion.
+            if ! cloudflared_owner_valid || ! cloudflared_unshared; then
+                printf '[提示] 检查结果已变化，保留 cloudflared。\n'
+                return 0
+            fi
+            rm -f -- /usr/local/bin/cloudflared || return 1
+            rm -f -- "$CONFIG_DIR/.cloudflared-owner" || return 1
+            printf '[完成] 已删除本脚本安装的 cloudflared。\n'
+            ;;
+        *) printf '[提示] 按照你的选择保留 cloudflared。\n' ;;
+    esac
+}
+ui_line() { printf '%b%s%b\n' "$CYAN" '------------------------------' "$PLAIN"; }
+ui_title() {
+    printf '\n'
+    ui_line
+    printf '  %s\n' "$1"
+    ui_line
+}
+ui_item() { printf '  %b[%s]%b %s\n' "$CYAN" "$1" "$PLAIN" "$2"; }
+ui_clear() {
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\033[H\033[2J'
+    else printf '\n'; fi
 }
 
 uninstall_all() {
@@ -2701,7 +2784,7 @@ uninstall_all() {
             if [ -n "$REAL_DOMAIN" ] && [ "${REAL_CERT_OWNED:-1}" == "1" ]; then
                 "$HOME"/.acme.sh/acme.sh --remove -d "$REAL_DOMAIN" >/dev/null 2>&1
             elif [ -n "$REAL_DOMAIN" ]; then
-                echo -e "${YELLOW}证书 ${REAL_DOMAIN} 为复用的已有证书，已保留其 acme.sh 续期记录。${PLAIN}"
+                echo -e "${YELLOW}[提示] 证书 ${REAL_DOMAIN} 为复用的已有证书，已保留其 acme.sh 续期记录。${PLAIN}"
             fi
         fi
         
@@ -2716,8 +2799,8 @@ uninstall_all() {
             fi
             printf '旧版 sysctl 备份已保留：%s\n' "$retained_backup"
         fi
+        offer_cloudflared_removal || return 1
         rm -rf /usr/local/bin/sing-box /usr/local/bin/sb /etc/sing-box || return 1
-        echo '已保留 cloudflared 组件，避免影响其他隧道；确认无其他使用者后可手动删除。'
 
         
         # Do not guess original kernel values or remove an unowned sysctl file.
@@ -2728,22 +2811,22 @@ uninstall_all() {
         [ -z "$_src" ] && [[ "${0}" != "/usr/local/bin/sb" && "${0}" != "sb" && "${0}" != *"/sb" ]] && _src="${0}"
         if [ -n "$_src" ] && [ -f "$_src" ] && [ "$_src" != "/usr/local/bin/sb" ]; then
             rm -f "$_src"
-            [ -f "$_src" ] && echo -e "${YELLOW}提示: 安装器文件 ${_src} 删除失败，请手动移除。${PLAIN}" || echo -e "${GREEN}已删除初始安装器: ${_src}${PLAIN}"
+            [ -f "$_src" ] && echo -e "${YELLOW}[提示] 提示: 安装器文件 ${_src} 删除失败，请手动移除。${PLAIN}" || echo -e "${GREEN}[完成] 已删除初始安装器: ${_src}${PLAIN}"
         fi
         
-        echo -e "${GREEN}脚本与节点配置已卸载；共享组件及系统网络参数已保留。${PLAIN}"
+        echo -e "${GREEN}[完成] 脚本与节点配置已卸载；系统网络参数未改动。${PLAIN}"
     fi
 }
 
 menu() {
     local choice=""
-    init_base || { echo -e "${RED}系统环境初始化失败，无法继续运行！${PLAIN}"; exit 1; }
+    init_base || { echo -e "${RED}[错误] 系统环境初始化失败，无法继续运行！${PLAIN}"; exit 1; }
     local LATEST_VER_CACHE
     LATEST_VER_CACHE=$(get_latest_version)
     GLOBAL_LATEST_VER="$LATEST_VER_CACHE"
     
     while true; do
-        clear
+        ui_clear
         if [ "$OS_TYPE" == "alpine" ]; then
             SB_STATUS=$(rc-service sing-box status 2>/dev/null | grep -o 'started')
             [ "$SB_STATUS" == "started" ] && SB_STATUS="active" || SB_STATUS="stopped"
@@ -2792,7 +2875,7 @@ menu() {
                 fi
                 ;;
             0) exit 0 ;;
-            *) echo "输入错误!"; sleep 1 ;;
+            *) echo "  [提示] 选项无效，请重新输入。"; sleep 1 ;;
         esac
         if [ "${CONFIG_TX_BLOCKED:-0}" = 1 ]; then
             echo '存在未完成恢复的事务，退出管理面板；请保留备份并人工检查。' >&2
@@ -3074,14 +3157,13 @@ restore_config_and_service() {
     commit_config
 }
 
-# Bootstrap before lock acquisition and the first script download.
-ensure_deps flock curl wget jq || exit 1
-if ! acquire_global_lock; then exit 1; fi
+# Bootstrap before the first script download.
+ensure_deps curl wget jq || exit 1
 
 if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" ]]; then
     if [ -f "/usr/local/bin/sb" ]; then
-        clear
-        echo -e "${GREEN}检测到 sing-box 管理脚本已经安装！${PLAIN}\n"
+        ui_clear
+        echo -e "${GREEN}[完成] 检测到 sing-box 管理脚本已经安装！${PLAIN}\n"
         echo -e " 1. 更新覆盖脚本 + 内核"
         echo -e " 2. 卸载脚本 + 内核"
         echo -e " 3. 进入面板"
@@ -3092,29 +3174,29 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
         ask "请选择 [1-4]: " pre_choice
         case "$pre_choice" in
             1)
-                echo -e "${CYAN}正在拉取最新脚本代码...${PLAIN}"
+                echo -e "${CYAN}[信息] 正在拉取最新脚本代码...${PLAIN}"
                 if ! fetch_script; then
-                    echo -e "${RED}下载脚本失败或内容校验不通过！${PLAIN}"
+                    echo -e "${RED}[错误] 下载脚本失败或内容校验不通过！${PLAIN}"
                     exit 1
                 fi
-                echo -e "${GREEN}脚本代码更新成功！${PLAIN}\n"
+                echo -e "${GREEN}[完成] 脚本代码更新成功！${PLAIN}\n"
 
                 CUR_K="未安装"
                 if kernel_ok; then
                     CUR_K=$( ( /usr/local/bin/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
                 fi
                 NEW_K=$(get_latest_version)
-                echo -e "${CYAN}当前内核: ${CUR_K}    最新版本: ${NEW_K:-获取失败}${PLAIN}"
+                echo -e "${CYAN}[信息] 当前内核: ${CUR_K}    最新版本: ${NEW_K:-获取失败}${PLAIN}"
 
                 if [ -z "$NEW_K" ]; then
-                    echo -e "${YELLOW}获取最新内核版本失败，已跳过内核覆盖。${PLAIN}"
-                    echo -e "${YELLOW}可稍后执行 sb 进入面板，用 [7) 更新] 单独处理内核。${PLAIN}"
+                    echo -e "${YELLOW}[提示] 获取最新内核版本失败，已跳过内核覆盖。${PLAIN}"
+                    echo -e "${YELLOW}[提示] 可稍后执行 sb 进入面板，用 [7) 更新] 单独处理内核。${PLAIN}"
                     exit 0
                 fi
 
                 do_kernel="n"
                 if ! kernel_ok; then
-                    echo -e "${RED}内核缺失或损坏，将强制覆盖安装 v${NEW_K}。${PLAIN}"
+                    echo -e "${RED}[错误] 内核缺失或损坏，将强制覆盖安装 v${NEW_K}。${PLAIN}"
                     do_kernel="y"
                 elif [ "$CUR_K" != "$NEW_K" ]; then
                     ask "发现新内核 v${NEW_K}，是否一并覆盖更新？(y/n) [默认: y]: " ans
@@ -3146,14 +3228,14 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
             *) exit 0 ;;
         esac
     else
-        echo -e "${CYAN}==> 正在将管理脚本写入到全局环境...${PLAIN}"
+        echo -e "${CYAN}[信息] ==> 正在将管理脚本写入到全局环境...${PLAIN}"
         mkdir -p "$CONFIG_DIR" 2>/dev/null
         save_secret "INSTALLER_SRC" "$0"
         if fetch_script; then
             echo -e "\n${GREEN}==> 脚本安装完成！以后可随时输入 ${YELLOW}sb${GREEN} 快捷调用本面板。${PLAIN}"
             sleep 2
         else
-            echo -e "${RED}初始化脚本下载失败或内容校验不通过，请检查网络！${PLAIN}"
+            echo -e "${RED}[错误] 初始化脚本下载失败或内容校验不通过，请检查网络！${PLAIN}"
             exit 1
         fi
     fi
