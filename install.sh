@@ -1442,7 +1442,7 @@ build_share_url() {
                 if [ -z "$IP" ]; then echo -e "${RED}[错误] [获取公网IP异常，无法生成 VLESS-REALITY 链接]${PLAIN}"; return; fi
                 local var_name="REALITY_PUB_${PORT}"
                 local PUB="${!var_name}"
-                echo "vless://${N_UUID}@${IP_URI}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
+                printf '%s\n' "vless://${N_UUID}@${IP_URI}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
             elif [ "$IS_WS" == "1" ]; then
                 local var_ip="ARGO_IP_${PORT}"
                 local var_dom="ARGO_DOMAIN_${PORT}"
@@ -1451,14 +1451,14 @@ build_share_url() {
                 if [ -z "$A_IP" ]; then echo -e "${RED}[错误] [无法读取 Argo IP，无法生成链接]${PLAIN}"; return; fi
                 local A_IP_URI
                 A_IP_URI=$(wrap_ipv6 "$A_IP")
-                echo "vless://${N_UUID}@${A_IP_URI}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
+                printf '%s\n' "vless://${N_UUID}@${A_IP_URI}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
             fi
             ;;
         hysteria2)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Hysteria2 链接]${PLAIN}"; return; fi
             local AUTH_ENC
             AUTH_ENC=$(url_encode "$N_PASS")
-            echo "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
+            printf '%s\n' "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
         tuic)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 TUIC 链接]${PLAIN}"; return; fi
@@ -1466,13 +1466,13 @@ build_share_url() {
             T_UUID_ENC=$(url_encode "$N_UUID")
             local T_PASS_ENC
             T_PASS_ENC=$(url_encode "$N_PASS")
-            echo "tuic://${T_UUID_ENC}:${T_PASS_ENC}@${CONN_ADDR_URI}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
+            printf '%s\n' "tuic://${T_UUID_ENC}:${T_PASS_ENC}@${CONN_ADDR_URI}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
         anytls)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 AnyTLS 链接]${PLAIN}"; return; fi
             local AUTH_ENC
             AUTH_ENC=$(url_encode "$N_PASS")
-            echo "anytls://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
+            printf '%s\n' "anytls://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
             ;;
         shadowsocks)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Shadowsocks 链接]${PLAIN}"; return; fi
@@ -1482,7 +1482,7 @@ build_share_url() {
             else
                 SS_CRED=$(printf '%s' "${SS_METHOD}:${N_PASS}" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
             fi
-            echo "ss://${SS_CRED}@${CONN_ADDR_URI}:${PORT}#${TAG}"
+            printf '%s\n' "ss://${SS_CRED}@${CONN_ADDR_URI}:${PORT}#${TAG}"
             ;;
     esac
 }
@@ -2402,7 +2402,11 @@ show_all_links() {
         echo -e "${RED}[错误] 未添加节点配置！${PLAIN}"
     else
         IP=$(get_ip)
-        for TAG in "${TAGS[@]}"; do build_share_url "$TAG" "$IP"; done
+        for TAG in "${TAGS[@]}"; do
+            build_share_url "$TAG" "$IP"
+            # A real blank line separates URLs even in terminal selections.
+            printf '\n'
+        done
     fi
     echo -e "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     pause
