@@ -35,7 +35,53 @@ FW_PORTS_FILE="$CONFIG_DIR/.fw_ports"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
+
+# Run the command in the current shell: transaction state must not be lost.
+# Only the visual indicator runs in the background. No invented percentage.
+SB_PROGRESS_PID=""
+stop_progress() {
+    if [ -n "${SB_PROGRESS_PID:-}" ]; then
+        kill "$SB_PROGRESS_PID" 2>/dev/null || :
+        wait "$SB_PROGRESS_PID" 2>/dev/null || :
+        SB_PROGRESS_PID=""
+    fi
+}
+run_step() {
+    local label="$1" log rc
+    shift
+    log=$(mktemp "${TMPDIR:-/tmp}/sing-box-step.XXXXXX") || return 1
+    chmod 600 "$log" || { rm -f "$log"; return 1; }
+    if [ -t 2 ] && [ "${TERM:-dumb}" != dumb ]; then
+        (
+            trap - EXIT
+            trap 'exit 0' INT TERM
+            frames=('[>>>.............]' '[...>>>..........]' '[......>>>.......]' '[.........>>>....]' '[............>>>.]')
+            i=0
+            while :; do
+                printf '\r\033[K%s %s' "${frames[i]}" "$label" >&2
+                i=$(( (i + 1) % ${#frames[@]} ))
+                sleep 0.2
+            done
+        ) &
+        SB_PROGRESS_PID=$!
+    else
+        printf '[进行中] %s\n' "$label" >&2
+    fi
+    if "$@" >"$log" 2>&1; then rc=0; else rc=$?; fi
+    stop_progress
+    if [ -t 2 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\r\033[K' >&2; fi
+    if [ "$rc" -eq 0 ]; then
+        printf '[完成] %s\n' "$label" >&2
+        rm -f "$log"
+    else
+        printf '[失败] %s（退出码 %s）\n日志：%s\n' "$label" "$rc" "$log" >&2
+        tail -n 15 "$log" >&2
+    fi
+    return "$rc"
+}
+
 cleanup_on_exit() {
+    stop_progress
     if [ -n "${CONFIG_TX_DIR:-}" ] && [ "${CONFIG_TX_RECOVERING:-0}" != 1 ]; then
         CONFIG_TX_RECOVERING=1
         restore_config_and_service || printf '事务恢复失败，备份保留: %s
@@ -313,22 +359,37 @@ apply_jq_config() {
 }
 
 http_get() {
-    local url="$1"
+    local url="$1" body
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 5 --max-time 10 "$url" 2>/dev/null && return 0
+        if body=$(curl -fsSL --connect-timeout 5 --max-time 10 "$url" 2>/dev/null); then
+            printf '%s' "$body"
+            return 0
+        fi
     fi
     if command -v wget >/dev/null 2>&1; then
-        wget -T 10 -qO - "$url" 2>/dev/null && return 0
+        if body=$(wget -T 10 -qO - "$url" 2>/dev/null); then
+            printf '%s' "$body"
+            return 0
+        fi
     fi
     return 1
 }
 
+copy_or_fetch_script() {
+    local installer="$1" target="$2"
+    if [ -n "$installer" ] && [[ "$installer" != /dev/* ]] && [ -f "$installer" ]; then
+        cp -- "$installer" "$target"
+    else
+        fetch_url "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" "$target"
+    fi
+}
 fetch_script() {
     local t
+    local installer="${1:-}"
     mkdir -p /usr/local/bin || return 1
     t=$(mktemp /usr/local/bin/.sb.XXXXXX) || return 1
     SB_OWNED_TEMP_FILES+=("$t")
-    if fetch_url "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" "$t" \
+    if copy_or_fetch_script "$installer" "$t" \
        && [ -s "$t" ] \
        && head -n 1 "$t" | grep -q '^#!/bin/bash' \
        && tail -n 5 "$t" | grep -q '^menu$' \
@@ -550,13 +611,16 @@ kernel_ok() {
 fetch_url() {
     local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
-        curl -fL --retry 2 --connect-timeout 15 -o "$out" "$url" && return 0
+        curl -fsSL --retry 2 --retry-max-time 600 --connect-timeout 15 \
+            --max-time 300 -o "$out" "$url" && return 0
     fi
+    # Discard any partial response before the fallback.
+    : > "$out" || return 1
     if command -v wget >/dev/null 2>&1; then
-        if wget --help 2>&1 | grep -q -- '--show-progress'; then
-            wget --show-progress -qO "$out" "$url" && return 0
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 300 wget -T 30 -qO "$out" "$url" && return 0
         else
-            wget -O "$out" "$url" && return 0
+            wget -T 30 -qO "$out" "$url" && return 0
         fi
     fi
     return 1
@@ -572,6 +636,7 @@ install_kernel() {
         d=$(mktemp -d /usr/local/bin/.kernel-tx.XXXXXX) || exit 1
         kernel_tx_finish() {
             local rc=$? failed=0
+            stop_progress
             trap - EXIT INT TERM
             if [ "$touched" = 1 ] && [ "$done_ok" = 0 ]; then
                 # Stop a partially started candidate before restoring the old binary.
@@ -613,21 +678,20 @@ install_kernel() {
             systemctl is-active --quiet sing-box && active=1
         fi
         if [ -e /usr/local/bin/sing-box ]; then cp -p /usr/local/bin/sing-box "$d/old" || exit 1; fi
-        printf '==> 正在下载 sing-box v%s (%s)...\n' "$ver" "$SB_ARCH"
-        fetch_url "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${SB_ARCH}.tar.gz" "$d/archive" || exit 1
+        run_step "[1/4] 下载 sing-box v${ver} (${SB_ARCH})" fetch_url "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${SB_ARCH}.tar.gz" "$d/archive" || exit 1
         mkdir "$d/extract" || exit 1
         # Extract only the expected binary, never arbitrary archive paths.
-        tar -xzf "$d/archive" -C "$d/extract" "sing-box-${ver}-linux-${SB_ARCH}/sing-box" || exit 1
+        run_step "[2/4] 解压内核" tar -xzf "$d/archive" -C "$d/extract" "sing-box-${ver}-linux-${SB_ARCH}/sing-box" || exit 1
         newbin="$d/extract/sing-box-${ver}-linux-${SB_ARCH}/sing-box"
         [ -f "$newbin" ] && [ ! -L "$newbin" ] && chown 0:0 "$newbin" && chmod 755 "$newbin" || exit 1
-        "$newbin" version >/dev/null 2>&1 || exit 1
-        if [ "$mode" != norestart ] && [ -f "$CONFIG_FILE" ]; then "$newbin" check -c "$CONFIG_FILE" || exit 1; fi
+        run_step "[3/4] 验证内核运行" "$newbin" version || exit 1
+        if [ "$mode" != norestart ] && [ -f "$CONFIG_FILE" ]; then run_step "检查现有配置兼容性" "$newbin" check -c "$CONFIG_FILE" || exit 1; fi
         touched=1
         if [ "$active" = 1 ]; then
-            if [ "$OS_TYPE" = alpine ]; then rc-service sing-box stop || exit 1; else systemctl stop sing-box || exit 1; fi
+            if [ "$OS_TYPE" = alpine ]; then run_step "停止旧内核" rc-service sing-box stop || exit 1; else run_step "停止旧内核" systemctl stop sing-box || exit 1; fi
         fi
-        mv -f "$newbin" /usr/local/bin/sing-box || exit 1
-        if [ "$mode" != norestart ]; then restart_service || exit 1; fi
+        run_step "[4/4] 安装内核" mv -f "$newbin" /usr/local/bin/sing-box || exit 1
+        if [ "$mode" != norestart ]; then run_step "启动并检查服务" restart_service || exit 1; fi
         done_ok=1
         printf '==> 内核 v%s 安装完毕！\n' "$ver"
     )
@@ -654,17 +718,17 @@ ensure_deps() {
 
     pkgs+=(ca-certificates)
     if [ "$OS_TYPE" == "alpine" ]; then
-        apk add --no-cache "${pkgs[@]}" || return 1
+        run_step "安装依赖（apk）" apk add --no-cache "${pkgs[@]}" || return 1
     elif [ "$OS_TYPE" == "centos" ]; then
         local pm=yum
         command -v dnf >/dev/null 2>&1 && pm=dnf
-        "$pm" install -y "${pkgs[@]}" || {
+        run_step "安装依赖（${pm}）" "$pm" install -y "${pkgs[@]}" || {
             echo '依赖安装失败，请检查软件仓库；部分系统需要管理员启用 EPEL。' >&2
             return 1
         }
     else
-        apt-get update || return 1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}" || return 1
+        run_step "更新软件包索引" apt-get update || return 1
+        run_step "安装依赖（apt）" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}" || return 1
     fi
     local still=()
     for c in "${miss[@]}"; do
@@ -686,7 +750,7 @@ init_base() {
         if [ ! -e /lib/ld-linux-x86-64.so.2 ] && [ ! -e /lib64/ld-linux-x86-64.so.2 ] \
            && [ ! -e /lib/ld-linux-aarch64.so.1 ] && [ ! -e /lib64/ld-linux-aarch64.so.1 ]; then
             echo -e "${CYAN}==> 正在安装 glibc 兼容层(sing-box 官方二进制需要)...${PLAIN}"
-            apk add libc6-compat gcompat >/dev/null 2>&1
+            run_step "安装兼容层" apk add libc6-compat gcompat || return 1
         fi
         rc-update add crond default >/dev/null 2>&1
         rc-service crond start >/dev/null 2>&1
@@ -707,7 +771,6 @@ init_base() {
                 return 1
             fi
         fi
-        echo -e "${CYAN}==> 开始下载 v${VERSION} 内核...${PLAIN}"
         install_kernel "$VERSION" norestart || return 1
         KERNEL_REINSTALLED=1
     fi
@@ -2409,7 +2472,7 @@ update_manage() {
                     pause; break ;;
                 2)
                     echo -e "\n${CYAN}正在拉取最新脚本代码...${PLAIN}"
-                    if fetch_script; then
+                    if fetch_script "${BASH_SOURCE[0]}"; then
                         echo -e "${GREEN}脚本代码更新成功！请重新运行 sb 命令。${PLAIN}"
                         exit 0
                     else
@@ -2566,43 +2629,73 @@ other_manage() {
     done
 }
 
+
+# Phase one of uninstall: stop/disable, but never remove files on failure.
+stop_managed_service() {
+    local svc="$1" state
+    [[ "$svc" == sing-box || "$svc" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || return 1
+    if [ "$OS_TYPE" = alpine ]; then
+        if [ ! -e "/etc/init.d/$svc" ]; then
+            [ ! -e "/etc/runlevels/default/$svc" ] && [ ! -L "/etc/runlevels/default/$svc" ]
+            return $?
+        fi
+        if rc-service "$svc" status >/dev/null 2>&1; then
+            rc-service "$svc" stop || return 1
+        fi
+        if rc-service "$svc" status >/dev/null 2>&1; then return 1; fi
+        if [ -e "/etc/runlevels/default/$svc" ] || [ -L "/etc/runlevels/default/$svc" ]; then
+            rc-update del "$svc" default || return 1
+        fi
+    else
+        state=$(systemctl show "$svc" -p LoadState --value) || return 1
+        case "$state" in
+            not-found) return 0 ;;
+            loaded|masked) ;;
+            *) printf '无法确认服务 %s 状态：%s\n' "$svc" "$state" >&2; return 1 ;;
+        esac
+        systemctl stop "$svc" || return 1
+        if systemctl is-active --quiet "$svc"; then return 1; fi
+        systemctl disable "$svc" || return 1
+    fi
+    return 0
+}
+
 uninstall_all() {
     local un
     ask "确认卸载脚本、sing-box和所有节点配置吗？(y/n): " un
-    if [[ "$un" == "y" ]]; then
-        load_secrets
+    [[ "$un" == "y" || "$un" == "Y" ]] || return 2
+    if [[ "$un" == "y" || "$un" == "Y" ]]; then
+        load_secrets || return 1
         [ -z "${_UNINST_SRC:-}" ] && _UNINST_SRC="${INSTALLER_SRC:-}"
+        local svc
+        local -a services=(sing-box) registered=()
+        IFS=',' read -r -a registered <<< "${ARGO_SERVICES:-}"
+        for svc in "${registered[@]}"; do
+            [[ "$svc" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || {
+                echo '服务登记记录无效，取消卸载。' >&2
+                return 1
+            }
+            services+=("$svc")
+        done
+        for svc in "${services[@]}"; do
+            if ! run_step "停止并禁用 ${svc}" stop_managed_service "$svc"; then
+                echo '卸载暂停：未删除程序和配置。部分服务可能已停止，请检查后重试。' >&2
+                return 1
+            fi
+        done
         remove_all_fw_rules || {
-            echo '卸载暂停：防火墙规则尚未确认清理，未删除配置。' >&2
+            echo '卸载暂停：防火墙清理失败，未删除程序和配置；服务已停止。' >&2
             return 1
         }
-        if [ "$OS_TYPE" == "alpine" ]; then
-            rc-service sing-box stop >/dev/null 2>&1
-            rc-update del sing-box default >/dev/null 2>&1
-            rm -f /etc/init.d/sing-box
-            if [ -n "${ARGO_SERVICES:-}" ]; then
-                while IFS= read -r svc; do
-                    [[ "$svc" =~ ^cloudflared-[a-zA-Z0-9_-]+$ ]] || continue
-                    rc-service "$svc" stop >/dev/null 2>&1
-                    rc-update del "$svc" default >/dev/null 2>&1
-                    rm -f -- "/etc/init.d/$svc"
-                done < <(printf '%s\n' "$ARGO_SERVICES" | tr ',' '\n')
+        for svc in "${services[@]}"; do
+            if [ "$OS_TYPE" = alpine ]; then
+                rm -f -- "/etc/init.d/$svc" || return 1
+            else
+                rm -f -- "/etc/systemd/system/$svc.service" || return 1
             fi
-        else
-            systemctl stop sing-box >/dev/null 2>&1
-            systemctl disable sing-box >/dev/null 2>&1
-            rm -f /etc/systemd/system/sing-box.service
-            if [ -n "${ARGO_SERVICES:-}" ]; then
-                while IFS= read -r svc; do
-                    [[ "$svc" =~ ^cloudflared-[a-zA-Z0-9_-]+$ ]] || continue
-                    systemctl stop "$svc" >/dev/null 2>&1
-                    systemctl disable "$svc" >/dev/null 2>&1
-                    rm -f -- "/etc/systemd/system/$svc.service"
-                done < <(printf '%s\n' "$ARGO_SERVICES" | tr ',' '\n')
-            fi
-            systemctl daemon-reload >/dev/null 2>&1
-        fi
-        
+        done
+        if [ "$OS_TYPE" != alpine ]; then systemctl daemon-reload || return 1; fi
+
         if [ -f "$HOME/.acme.sh/acme.sh" ]; then
             load_secrets
             if [ -n "$REAL_DOMAIN" ] && [ "${REAL_CERT_OWNED:-1}" == "1" ]; then
@@ -2691,7 +2784,13 @@ menu() {
             6) run_manage ;;
             7) update_manage ;;
             8) other_manage ;;
-            9) uninstall_all; exit 0 ;;
+            9)
+                if uninstall_all; then exit 0
+                else
+                    local un_rc=$?
+                    [ "$un_rc" -eq 2 ] || exit "$un_rc"
+                fi
+                ;;
             0) exit 0 ;;
             *) echo "输入错误!"; sleep 1 ;;
         esac
@@ -3036,7 +3135,13 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
                 echo -e "\n${GREEN}处理完毕！请执行 sb 命令进入面板。${PLAIN}"
                 exit 0
                 ;;
-            2) uninstall_all; exit 0 ;;
+            2)
+                if uninstall_all; then exit 0
+                else
+                    un_rc=$?
+                    [ "$un_rc" -eq 2 ] || exit "$un_rc"
+                fi
+                ;;
             3) ;;
             *) exit 0 ;;
         esac
