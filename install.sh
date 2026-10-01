@@ -610,6 +610,37 @@ fetch_url() {
     return 1
 }
 
+
+stop_sing_box_if_present() {
+    local state rc
+    if [ "$OS_TYPE" = alpine ]; then
+        if [ ! -e /etc/init.d/sing-box ] && [ ! -L /etc/init.d/sing-box ]; then return 0; fi
+        rc-service sing-box status >/dev/null 2>&1
+        rc=$?
+        # OpenRC: 3 means stopped. Other errors must not be hidden.
+        [ "$rc" = 3 ] && return 0
+        if [ "$rc" != 0 ]; then
+            printf '无法确认 sing-box 状态，退出码：%s\n' "$rc" >&2
+            return 1
+        fi
+        rc-service sing-box stop || return 1
+        rc-service sing-box status >/dev/null 2>&1
+        rc=$?
+        [ "$rc" = 3 ] || { printf 'sing-box 未确认停止。\n' >&2; return 1; }
+    else
+        state=$(systemctl show sing-box -p LoadState --value) || return 1
+        case "$state" in
+            not-found) return 0 ;;
+            loaded|masked) ;;
+            *) printf '无法确认 sing-box 服务：%s\n' "$state" >&2; return 1 ;;
+        esac
+        systemctl stop sing-box || return 1
+        state=$(systemctl show sing-box -p ActiveState --value) || return 1
+        case "$state" in inactive|failed) ;; *) printf 'sing-box 未停止：%s\n' "$state" >&2; return 1 ;; esac
+    fi
+    return 0
+}
+
 install_kernel() {
     local ver="$1" mode="${2:-restart}"
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || return 1
@@ -624,13 +655,7 @@ install_kernel() {
             trap - EXIT INT TERM
             if [ "$touched" = 1 ] && [ "$done_ok" = 0 ]; then
                 # Stop a partially started candidate before restoring the old binary.
-                if [ "$OS_TYPE" = alpine ]; then
-                    rc-service sing-box stop >/dev/null 2>&1 || {
-                        rc-service sing-box status >/dev/null 2>&1 && failed=1
-                    }
-                else
-                    systemctl stop sing-box >/dev/null 2>&1 || failed=1
-                fi
+                stop_sing_box_if_present || failed=1
                 if [ -f "$d/old" ]; then
                     if ! cp -p "$d/old" "$d/restore" || ! mv -f "$d/restore" /usr/local/bin/sing-box; then failed=1; fi
                 else
@@ -828,11 +853,8 @@ restart_service() {
         return 1
     fi
     if [ "$INBOUND_COUNT" -eq 0 ]; then
-        if [ "$OS_TYPE" == "alpine" ]; then
-            rc-service sing-box stop >/dev/null 2>&1 || return 1
-        else
-            systemctl stop sing-box >/dev/null 2>&1 || return 1
-        fi
+        stop_sing_box_if_present || return 1
+        printf '[提示] 暂无节点，无需启动服务。\n'
         return 0
     fi
 
@@ -858,8 +880,8 @@ EOF
                 return 1
             fi
         fi
-        rc-update add sing-box default >/dev/null 2>&1 || return 1
-        rc-service sing-box restart >/dev/null 2>&1 || return 1
+        rc-update add sing-box default || return 1
+        rc-service sing-box restart || return 1
         sleep 2
         if ! rc-service sing-box status 2>/dev/null | grep -q 'started'; then return 1; fi
     else
@@ -886,8 +908,8 @@ EOF
             fi
         fi
         systemctl daemon-reload || return 1
-        systemctl enable sing-box >/dev/null 2>&1 || return 1
-        systemctl restart sing-box >/dev/null 2>&1 || return 1
+        systemctl enable sing-box || return 1
+        systemctl restart sing-box || return 1
         sleep 2
         if [ "$(systemctl is-active sing-box 2>/dev/null)" != "active" ]; then
             sleep 2
@@ -2564,17 +2586,37 @@ enable_bbr() {
     local cc qdisc stage
     cc=$(sysctl -n net.ipv4.tcp_congestion_control) || return 1
     qdisc=$(sysctl -n net.core.default_qdisc) || return 1
-    if [ "$cc" = bbr ]; then
-        printf '[提示] 当前已启用 BBR，未修改设置。\n'
-        pause
-        return 0
-    fi
-    if [ -e "$BBR_STATE_DIR" ] || [ -L "$BBR_STATE_DIR" ] ||
-       [ -e "$BBR_SYSCTL_FILE" ] || [ -L "$BBR_SYSCTL_FILE" ]; then
-        printf '[提示] 存在 BBR 配置或恢复记录，请先检查，未覆盖。\n'
+    printf '[信息] 当前算法：%s；默认队列：%s。\n' "$cc" "$qdisc"
+    if [ -e "$BBR_STATE_DIR" ] || [ -L "$BBR_STATE_DIR" ]; then
+        if ! bbr_state_valid || [ -L "$BBR_SYSCTL_FILE" ] ||
+           ! cmp -s "$BBR_STATE_DIR/managed.conf" "$BBR_SYSCTL_FILE"; then
+            printf '[提示] BBR+FQ 记录或配置已变化，请先检查；未覆盖。\n'
+            pause
+            return 1
+        fi
+        if [ "$cc" = bbr ] && [ "$qdisc" = fq ]; then
+            printf '[完成] BBR+FQ 已生效，本脚本的持久化配置存在。\n'
+            pause
+            return 0
+        fi
+        if run_step "重新应用 BBR+FQ" sysctl -p "$BBR_SYSCTL_FILE" &&
+           [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = bbr ] &&
+           [ "$(sysctl -n net.core.default_qdisc)" = fq ]; then
+            printf '[完成] BBR+FQ 已重新应用，原始备份保持不变。\n'
+            pause
+            return 0
+        fi
+        printf '[错误] BBR+FQ 未完全生效，配置及恢复记录已保留。\n' >&2
         pause
         return 1
     fi
+    if [ -e "$BBR_SYSCTL_FILE" ] || [ -L "$BBR_SYSCTL_FILE" ]; then
+        printf '[提示] 存在非本脚本登记的 BBR 配置，未覆盖。\n'
+        pause
+        return 1
+    fi
+    # Even if BBR/FQ is already active, continue to create a managed
+    # persistent config and save the actual pre-change values.
     # Leave all pre-existing persistent settings untouched.
     if [ -f /etc/sysctl.conf ] &&
        grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' /etc/sysctl.conf; then
