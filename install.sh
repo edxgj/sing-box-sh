@@ -2537,7 +2537,7 @@ offer_bbr_restore() {
     local reply cc qdisc
     if [ ! -d "$BBR_STATE_DIR" ]; then
         if [ -e /etc/sysctl.d/99-bbr.conf ] || [ -f "$CONFIG_DIR/.sysctl_backup" ]; then
-            printf '[提示] 旧版 BBR 无完整恢复记录，保持现状，不猜测系统默认值。\n'
+            printf '[提示] 无 BBR+FQ 修改记录，保持当前设置。\n'
         fi
         return 0
     fi
@@ -2547,16 +2547,16 @@ offer_bbr_restore() {
     fi
     { IFS= read -r cc && IFS= read -r qdisc; } < "$BBR_STATE_DIR/original" || return 1
     printf '[信息] 修改前：拥塞控制=%s，队列=%s。\n' "$cc" "$qdisc"
-    ask "是否恢复本脚本修改前的 BBR/队列设置？[y/N]: " reply
+    ask "是否恢复修改前的网络算法和队列？[y/N]: " reply
     case "$reply" in
         y|Y)
             if restore_managed_bbr; then
-                printf '[完成] 已恢复修改前的网络参数，并移除本脚本的 BBR 配置。\n'
+                printf '[完成] 已恢复原网络算法和队列。\n'
             else
                 printf '[错误] 恢复未完成或配置已被修改；卸载暂停，恢复记录保留：%s\n' "$BBR_STATE_DIR" >&2
                 return 1
             fi ;;
-        *) printf '[提示] 保留 BBR 设置及恢复记录：%s\n' "$BBR_STATE_DIR" ;;
+        *) printf '[提示] 保留 BBR+FQ，备份：%s\n' "$BBR_STATE_DIR" ;;
     esac
 }
 
@@ -2565,7 +2565,7 @@ enable_bbr() {
     cc=$(sysctl -n net.ipv4.tcp_congestion_control) || return 1
     qdisc=$(sysctl -n net.core.default_qdisc) || return 1
     if [ "$cc" = bbr ]; then
-        printf '[提示] BBR 已开启，不重复修改或认领现有设置。\n'
+        printf '[提示] 当前已启用 BBR，未修改设置。\n'
         pause
         return 0
     fi
@@ -2600,10 +2600,10 @@ enable_bbr() {
         return 1
     fi
     modprobe tcp_bbr 2>/dev/null || :
-    if run_step "应用 BBR 设置" sysctl -p "$BBR_SYSCTL_FILE" &&
+    if run_step "应用 BBR+FQ" sysctl -p "$BBR_SYSCTL_FILE" &&
        [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = bbr ] &&
        [ "$(sysctl -n net.core.default_qdisc)" = fq ]; then
-        printf '[完成] BBR 已开启；修改前参数已保存，卸载时可选择恢复。\n'
+        printf '[完成] BBR+FQ 已开启，原配置已备份。\n'
     else
         if restore_managed_bbr; then
             printf '[错误] 开启失败，已恢复修改前参数。\n' >&2
@@ -2679,7 +2679,7 @@ other_manage() {
     while true; do
         ui_clear
         echo -e "选择: 其他\n"
-        echo -e " 1) 开启 BBR 加速"
+        echo -e " 1) 开启 BBR+FQ"
         echo -e " 2) 配置出站 IPv4/IPv6"
         echo -e " 0) 返回\n"
         ask "请选择 [0-2]: " om_idx
@@ -2797,8 +2797,11 @@ ui_title() {
 }
 ui_item() { printf '  %b[%s]%b %s\n' "$CYAN" "$1" "$PLAIN" "$2"; }
 ui_clear() {
-    # Preserve terminal history; separate successive menus only.
-    printf '\n\n'
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
+        printf '\033[H\033[2J'
+    else
+        printf '\n'
+    fi
 }
 
 uninstall_all() {
