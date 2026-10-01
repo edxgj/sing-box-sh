@@ -2504,52 +2504,114 @@ update_manage() {
     done
 }
 
-enable_bbr() {
-    echo -e "${CYAN}[信息] ==> 尝试开启 BBR 加速...${PLAIN}"
-    local current_cc
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [ "$current_cc" == "bbr" ]; then
-        echo -e "${GREEN}[完成] 当前系统已经开启了 BBR，无需重复配置！${PLAIN}"
-        pause
-        return
-    fi
 
-    if [ -e /etc/sysctl.d/99-bbr.conf ] || [ -L /etc/sysctl.d/99-bbr.conf ]; then
-        echo '发现已有 /etc/sysctl.d/99-bbr.conf，拒绝覆盖。请先手动检查该配置。' >&2
+# Keep recovery state outside CONFIG_DIR so uninstall/declining restore
+# never destroys the original values.
+BBR_STATE_DIR="/var/lib/sing-box-manager/bbr"
+BBR_SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
+bbr_state_valid() {
+    local cc qdisc
+    [ -f "$BBR_STATE_DIR/original" ] && [ ! -L "$BBR_STATE_DIR/original" ] || return 1
+    [ -f "$BBR_STATE_DIR/managed.conf" ] || return 1
+    { IFS= read -r cc && IFS= read -r qdisc; } < "$BBR_STATE_DIR/original" || return 1
+    [[ "$cc" =~ ^[a-zA-Z0-9_-]+$ && "$qdisc" =~ ^[a-zA-Z0-9_-]+$ ]]
+}
+restore_managed_bbr() {
+    local cc qdisc
+    bbr_state_valid || return 1
+    [ ! -L "$BBR_SYSCTL_FILE" ] || return 1
+    # Do not overwrite a config subsequently edited by the administrator.
+    if [ -e "$BBR_SYSCTL_FILE" ]; then
+        cmp -s "$BBR_STATE_DIR/managed.conf" "$BBR_SYSCTL_FILE" || return 1
+    fi
+    { IFS= read -r cc && IFS= read -r qdisc; } < "$BBR_STATE_DIR/original" || return 1
+    sysctl -q -w "net.core.default_qdisc=$qdisc" || return 1
+    sysctl -q -w "net.ipv4.tcp_congestion_control=$cc" || return 1
+    [ "$(sysctl -n net.core.default_qdisc)" = "$qdisc" ] || return 1
+    [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "$cc" ] || return 1
+    rm -f -- "$BBR_SYSCTL_FILE" || return 1
+    rm -rf -- "$BBR_STATE_DIR" || return 1
+    return 0
+}
+offer_bbr_restore() {
+    local reply cc qdisc
+    if [ ! -d "$BBR_STATE_DIR" ]; then
+        if [ -e /etc/sysctl.d/99-bbr.conf ] || [ -f "$CONFIG_DIR/.sysctl_backup" ]; then
+            printf '[提示] 旧版 BBR 无完整恢复记录，保持现状，不猜测系统默认值。\n'
+        fi
+        return 0
+    fi
+    if ! bbr_state_valid; then
+        printf '[提示] BBR 恢复记录不完整，保留设置和记录：%s\n' "$BBR_STATE_DIR"
+        return 0
+    fi
+    { IFS= read -r cc && IFS= read -r qdisc; } < "$BBR_STATE_DIR/original" || return 1
+    printf '[信息] 修改前：拥塞控制=%s，队列=%s。\n' "$cc" "$qdisc"
+    ask "是否恢复本脚本修改前的 BBR/队列设置？[y/N]: " reply
+    case "$reply" in
+        y|Y)
+            if restore_managed_bbr; then
+                printf '[完成] 已恢复修改前的网络参数，并移除本脚本的 BBR 配置。\n'
+            else
+                printf '[错误] 恢复未完成或配置已被修改；卸载暂停，恢复记录保留：%s\n' "$BBR_STATE_DIR" >&2
+                return 1
+            fi ;;
+        *) printf '[提示] 保留 BBR 设置及恢复记录：%s\n' "$BBR_STATE_DIR" ;;
+    esac
+}
+
+enable_bbr() {
+    local cc qdisc stage
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control) || return 1
+    qdisc=$(sysctl -n net.core.default_qdisc) || return 1
+    if [ "$cc" = bbr ]; then
+        printf '[提示] BBR 已开启，不重复修改或认领现有设置。\n'
+        pause
+        return 0
+    fi
+    if [ -e "$BBR_STATE_DIR" ] || [ -L "$BBR_STATE_DIR" ] ||
+       [ -e "$BBR_SYSCTL_FILE" ] || [ -L "$BBR_SYSCTL_FILE" ]; then
+        printf '[提示] 存在 BBR 配置或恢复记录，请先检查，未覆盖。\n'
         pause
         return 1
     fi
-    modprobe tcp_bbr 2>/dev/null
-
-    if [ -f /etc/sysctl.conf ]; then
-        if grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' /etc/sysctl.conf; then
-            if [ ! -f "$CONFIG_DIR/.sysctl_backup" ]; then
-                mkdir -p "$CONFIG_DIR" 2>/dev/null
-                grep -E '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' \
-                    /etc/sysctl.conf > "$CONFIG_DIR/.sysctl_backup" 2>/dev/null
-                chmod 600 "$CONFIG_DIR/.sysctl_backup" 2>/dev/null
-                echo -e "${CYAN}[信息] 已备份 /etc/sysctl.conf 中原有的 qdisc/拥塞控制设置。${PLAIN}"
-            fi
-        fi
+    # Leave all pre-existing persistent settings untouched.
+    if [ -f /etc/sysctl.conf ] &&
+       grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' /etc/sysctl.conf; then
+        printf '[提示] /etc/sysctl.conf 已定义相关参数，请先处理冲突；未修改原文件。\n'
+        pause
+        return 1
     fi
-
-    sed -i '/^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=/d' /etc/sysctl.conf 2>/dev/null
-    sed -i '/^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/d' /etc/sysctl.conf 2>/dev/null
-
-    mkdir -p /etc/sysctl.d
-    cat > /etc/sysctl.d/99-bbr.conf << 'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-
-    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1
-
-    local new_cc
-    new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [ "$new_cc" == "bbr" ]; then
-        echo -e "${GREEN}[完成] BBR 加速开启成功！配置已写入 /etc/sysctl.d/99-bbr.conf，重启后依然生效。${PLAIN}"
+    [[ "$cc" =~ ^[a-zA-Z0-9_-]+$ && "$qdisc" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    mkdir -p /var/lib/sing-box-manager /etc/sysctl.d || return 1
+    stage=$(mktemp -d /var/lib/sing-box-manager/.bbr.XXXXXX) || return 1
+    if ! printf '%s\n' "$cc" "$qdisc" > "$stage/original" ||
+       ! printf '%s\n' 'net.core.default_qdisc=fq' 'net.ipv4.tcp_congestion_control=bbr' > "$stage/managed.conf"; then
+        rm -rf -- "$stage"
+        return 1
+    fi
+    if ! mv -T -n "$stage" "$BBR_STATE_DIR" || [ -d "$stage" ]; then
+        rm -rf -- "$stage"
+        return 1
+    fi
+    # Exclusive creation: never clobber an existing file.
+    if ! (set -C; cat "$BBR_STATE_DIR/managed.conf" > "$BBR_SYSCTL_FILE"); then
+        printf '[错误] BBR 配置创建失败；保留恢复记录，请检查。\n' >&2
+        return 1
+    fi
+    modprobe tcp_bbr 2>/dev/null || :
+    if run_step "应用 BBR 设置" sysctl -p "$BBR_SYSCTL_FILE" &&
+       [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = bbr ] &&
+       [ "$(sysctl -n net.core.default_qdisc)" = fq ]; then
+        printf '[完成] BBR 已开启；修改前参数已保存，卸载时可选择恢复。\n'
     else
-        echo -e "${YELLOW}[提示] 应用失败，当前系统内核可能不支持 BBR，或架构受限（如 OpenVZ/LXC 容器）无法修改内核参数。${PLAIN}"
+        if restore_managed_bbr; then
+            printf '[错误] 开启失败，已恢复修改前参数。\n' >&2
+        else
+            printf '[错误] 开启或恢复失败，保留记录：%s\n' "$BBR_STATE_DIR" >&2
+        fi
+        pause
+        return 1
     fi
     pause
 }
@@ -2704,29 +2766,25 @@ cloudflared_unshared() {
     return 0
 }
 offer_cloudflared_removal() {
-    local reply
-    if ! cloudflared_owner_valid; then
-        if type -P cloudflared >/dev/null || [ -e /usr/local/bin/cloudflared ]; then
-            printf '[提示] cloudflared 无有效归属记录或文件已变更，已保留。\n'
-        fi
+    local reply candidate
+    candidate=$(type -P cloudflared) || candidate=""
+    if [ -z "$candidate" ] && [ ! -e /usr/local/bin/cloudflared ] && [ ! -L /usr/local/bin/cloudflared ]; then
         return 0
     fi
-    if ! cloudflared_unshared; then
-        printf '[提示] cloudflared 疑似被共用或检查不完整，已保留。\n'
-        return 0
-    fi
-    ask "检测到本脚本安装的 cloudflared，是否一并删除？[y/N]: " reply
+    ask "检测到 cloudflared，是否一并卸载？[y/N]: " reply
     case "$reply" in
         y|Y)
-            # Recheck after the prompt, before deletion.
-            if ! cloudflared_owner_valid || ! cloudflared_unshared; then
-                printf '[提示] 检查结果已变化，保留 cloudflared。\n'
+            if ! cloudflared_owner_valid; then
+                printf '[提示] cloudflared 无有效安装归属记录或文件已变更，为防误删已保留。\n'
+                return 0
+            fi
+            if ! cloudflared_unshared; then
+                printf '[提示] cloudflared 疑似被其他隧道使用或检查不完整，已保留。\n'
                 return 0
             fi
             rm -f -- /usr/local/bin/cloudflared || return 1
             rm -f -- "$CONFIG_DIR/.cloudflared-owner" || return 1
-            printf '[完成] 已删除本脚本安装的 cloudflared。\n'
-            ;;
+            printf '[完成] 已卸载本脚本安装的 cloudflared。\n' ;;
         *) printf '[提示] 按照你的选择保留 cloudflared。\n' ;;
     esac
 }
@@ -2739,8 +2797,8 @@ ui_title() {
 }
 ui_item() { printf '  %b[%s]%b %s\n' "$CYAN" "$1" "$PLAIN" "$2"; }
 ui_clear() {
-    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\033[H\033[2J'
-    else printf '\n'; fi
+    # Preserve terminal history; separate successive menus only.
+    printf '\n\n'
 }
 
 uninstall_all() {
@@ -2800,11 +2858,11 @@ uninstall_all() {
             printf '旧版 sysctl 备份已保留：%s\n' "$retained_backup"
         fi
         offer_cloudflared_removal || return 1
+        offer_bbr_restore || return 1
         rm -rf /usr/local/bin/sing-box /usr/local/bin/sb /etc/sing-box || return 1
 
         
         # Do not guess original kernel values or remove an unowned sysctl file.
-        echo 'BBR 和系统队列设置保持不变；本次卸载不会重置系统网络参数。'
 
         local _src=""
         [ -n "${_UNINST_SRC:-}" ] && _src="$_UNINST_SRC"
@@ -2814,7 +2872,7 @@ uninstall_all() {
             [ -f "$_src" ] && echo -e "${YELLOW}[提示] 提示: 安装器文件 ${_src} 删除失败，请手动移除。${PLAIN}" || echo -e "${GREEN}[完成] 已删除初始安装器: ${_src}${PLAIN}"
         fi
         
-        echo -e "${GREEN}[完成] 脚本与节点配置已卸载；系统网络参数未改动。${PLAIN}"
+        echo -e "${GREEN}[完成] 已卸载 sing-box、管理脚本和节点配置。${PLAIN}"
     fi
 }
 
