@@ -2531,6 +2531,7 @@ update_manage() {
 # never destroys the original values.
 BBR_STATE_DIR="/var/lib/sing-box-manager/bbr"
 BBR_SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
+CLOUDFLARED_OWNER_FILE="/var/lib/sing-box-manager/cloudflared-owner"
 bbr_state_valid() {
     local cc qdisc
     [ -f "$BBR_STATE_DIR/original" ] && [ ! -L "$BBR_STATE_DIR/original" ] || return 1
@@ -2538,20 +2539,71 @@ bbr_state_valid() {
     { IFS= read -r cc && IFS= read -r qdisc; } < "$BBR_STATE_DIR/original" || return 1
     [[ "$cc" =~ ^[a-zA-Z0-9_-]+$ && "$qdisc" =~ ^[a-zA-Z0-9_-]+$ ]]
 }
+
+bbr_rollback_runtime() {
+    local cc="$1" qdisc="$2" actual_cc actual_qdisc failed=0
+    sysctl -q -w "net.ipv4.tcp_congestion_control=$cc" || failed=1
+    sysctl -q -w "net.core.default_qdisc=$qdisc" || failed=1
+    actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control) || failed=1
+    actual_qdisc=$(sysctl -n net.core.default_qdisc) || failed=1
+    if [ "$actual_cc" != "$cc" ] || [ "$actual_qdisc" != "$qdisc" ]; then failed=1; fi
+    if [ "$failed" = 0 ]; then
+        printf '[提示] 恢复失败，已撤回本次运行参数修改。\n' >&2
+    else
+        printf '[错误] 撤回未完成；当前算法=%s，队列=%s；备份=%s\n' "$actual_cc" "$actual_qdisc" "$BBR_STATE_DIR" >&2
+    fi
+    return "$failed"
+}
+# Conservative scan: any external definition is shown, never silently overwritten.
+bbr_check_conflicts() {
+    local f dir rc failed=0
+    local pattern='^[[:space:]]*-?[[:space:]]*net[./](core[./]default_qdisc|ipv4[./]tcp_congestion_control)[[:space:]]*='
+    local -a files=(/etc/sysctl.conf)
+    for dir in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+        for f in "$dir"/*.conf; do
+            [ -e "$f" ] || [ -L "$f" ] || continue
+            [ "$f" = "$BBR_SYSCTL_FILE" ] && continue
+            files+=("$f")
+        done
+    done
+    for f in "${files[@]}"; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        grep -nE "$pattern" "$f" >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" = 0 ]; then
+            printf '[提示] 检测到外部网络配置：%s，请先确认冲突。\n' "$f" >&2
+            failed=1
+        elif [ "$rc" != 1 ]; then
+            printf '[错误] 无法检查网络配置：%s\n' "$f" >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
 restore_managed_bbr() {
-    local cc qdisc
+    local cc qdisc old_cc old_qdisc failed=0
     bbr_state_valid || return 1
     [ ! -L "$BBR_SYSCTL_FILE" ] || return 1
-    # Do not overwrite a config subsequently edited by the administrator.
-    if [ -e "$BBR_SYSCTL_FILE" ]; then
-        cmp -s "$BBR_STATE_DIR/managed.conf" "$BBR_SYSCTL_FILE" || return 1
-    fi
+    if [ -e "$BBR_SYSCTL_FILE" ] &&
+       ! cmp -s "$BBR_STATE_DIR/managed.conf" "$BBR_SYSCTL_FILE"; then return 1; fi
     { IFS= read -r cc && IFS= read -r qdisc; } < "$BBR_STATE_DIR/original" || return 1
-    sysctl -q -w "net.core.default_qdisc=$qdisc" || return 1
-    sysctl -q -w "net.ipv4.tcp_congestion_control=$cc" || return 1
-    [ "$(sysctl -n net.core.default_qdisc)" = "$qdisc" ] || return 1
-    [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "$cc" ] || return 1
-    rm -f -- "$BBR_SYSCTL_FILE" || return 1
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control) || return 1
+    old_qdisc=$(sysctl -n net.core.default_qdisc) || return 1
+    sysctl -q -w "net.core.default_qdisc=$qdisc" || failed=1
+    if [ "$failed" = 0 ]; then
+        sysctl -q -w "net.ipv4.tcp_congestion_control=$cc" || failed=1
+    fi
+    [ "$(sysctl -n net.core.default_qdisc)" = "$qdisc" ] || failed=1
+    [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "$cc" ] || failed=1
+    if [ "$failed" != 0 ]; then
+        bbr_rollback_runtime "$old_cc" "$old_qdisc" || :
+        return 1
+    fi
+    if ! rm -f -- "$BBR_SYSCTL_FILE"; then
+        bbr_rollback_runtime "$old_cc" "$old_qdisc" || :
+        return 1
+    fi
     rm -rf -- "$BBR_STATE_DIR" || return 1
     return 0
 }
@@ -2587,12 +2639,28 @@ enable_bbr() {
     cc=$(sysctl -n net.ipv4.tcp_congestion_control) || return 1
     qdisc=$(sysctl -n net.core.default_qdisc) || return 1
     printf '[信息] 当前算法：%s；默认队列：%s。\n' "$cc" "$qdisc"
+    bbr_check_conflicts || { pause; return 1; }
     if [ -e "$BBR_STATE_DIR" ] || [ -L "$BBR_STATE_DIR" ]; then
-        if ! bbr_state_valid || [ -L "$BBR_SYSCTL_FILE" ] ||
-           ! cmp -s "$BBR_STATE_DIR/managed.conf" "$BBR_SYSCTL_FILE"; then
-            printf '[提示] BBR+FQ 记录或配置已变化，请先检查；未覆盖。\n'
+        if ! bbr_state_valid || [ -L "$BBR_SYSCTL_FILE" ]; then
+            printf '[提示] BBR+FQ 恢复记录无效，请先检查；未覆盖。\n'
             pause
             return 1
+        fi
+        if [ -e "$BBR_SYSCTL_FILE" ] &&
+           ! cmp -s "$BBR_STATE_DIR/managed.conf" "$BBR_SYSCTL_FILE"; then
+            printf '[提示] BBR+FQ 配置已被外部修改，请先检查；未覆盖。\n'
+            pause
+            return 1
+        fi
+        if [ ! -e "$BBR_SYSCTL_FILE" ]; then
+            local rebuild
+            ask "BBR+FQ 配置缺失，是否按有效记录重建？[y/N]: " rebuild
+            case "$rebuild" in y|Y) ;; *) pause; return 0 ;; esac
+            if ! (set -C; cat "$BBR_STATE_DIR/managed.conf" > "$BBR_SYSCTL_FILE"); then
+                printf '[错误] 无法重建 BBR+FQ 持久化配置。\n' >&2
+                pause
+                return 1
+            fi
         fi
         if [ "$cc" = bbr ] && [ "$qdisc" = fq ]; then
             printf '[完成] BBR+FQ 已生效，本脚本的持久化配置存在。\n'
@@ -2772,16 +2840,20 @@ record_cloudflared_owner() {
     [ "$bin" = /usr/local/bin/cloudflared ] && [ -f "$bin" ] && [ ! -L "$bin" ] || return 1
     sum=$(sha256sum "$bin") || return 1
     sum=${sum%% *}
-    mkdir -p "$CONFIG_DIR" || return 1
-    tmp=$(mktemp "$CONFIG_DIR/.cloudflared-owner.XXXXXX") || return 1
+    mkdir -p "$(dirname "$CLOUDFLARED_OWNER_FILE")" || return 1
+    tmp=$(mktemp "$CLOUDFLARED_OWNER_FILE.XXXXXX") || return 1
     if printf '%s\n' 'sing-box-manager-v1' "$bin" "$sum" > "$tmp" &&
-       chmod 600 "$tmp" && mv -f "$tmp" "$CONFIG_DIR/.cloudflared-owner"; then return 0; fi
+       chmod 600 "$tmp" && mv -f "$tmp" "$CLOUDFLARED_OWNER_FILE"; then return 0; fi
     rm -f "$tmp"
     return 1
 }
 cloudflared_owner_valid() {
-    local record="$CONFIG_DIR/.cloudflared-owner" sum
+    local record="$CLOUDFLARED_OWNER_FILE" sum legacy=0
     local -a fields=()
+    if [ ! -e "$record" ] && [ ! -L "$record" ]; then
+        record="$CONFIG_DIR/.cloudflared-owner"
+        legacy=1
+    fi
     [ -f "$record" ] && [ ! -L "$record" ] || return 1
     mapfile -t fields < "$record" || return 1
     [ "${#fields[@]}" = 3 ] || return 1
@@ -2790,7 +2862,15 @@ cloudflared_owner_valid() {
     [[ "${fields[2]}" =~ ^[a-f0-9]{64}$ ]] || return 1
     [ -f "${fields[1]}" ] && [ ! -L "${fields[1]}" ] || return 1
     sum=$(sha256sum "${fields[1]}") || return 1
-    [ "${sum%% *}" = "${fields[2]}" ]
+    [ "${sum%% *}" = "${fields[2]}" ] || return 1
+    if [ "$legacy" = 1 ]; then
+        record_cloudflared_owner "${fields[1]}" || {
+            echo '[错误] cloudflared 归属迁移失败。' >&2
+            return 2
+        }
+        rm -f -- "$record" || return 2
+    fi
+    return 0
 }
 cloudflared_unshared() {
     local processes dir rc
@@ -2808,27 +2888,30 @@ cloudflared_unshared() {
     return 0
 }
 offer_cloudflared_removal() {
-    local reply candidate
+    local candidate=""
     candidate=$(type -P cloudflared) || candidate=""
-    if [ -z "$candidate" ] && [ ! -e /usr/local/bin/cloudflared ] && [ ! -L /usr/local/bin/cloudflared ]; then
+    if [ -z "$candidate" ] &&
+       [ ! -e /usr/local/bin/cloudflared ] &&
+       [ ! -L /usr/local/bin/cloudflared ]; then
         return 0
     fi
-    ask "检测到 cloudflared，是否一并卸载？[y/N]: " reply
-    case "$reply" in
-        y|Y)
-            if ! cloudflared_owner_valid; then
-                printf '[提示] cloudflared 无有效安装归属记录或文件已变更，为防误删已保留。\n'
-                return 0
-            fi
-            if ! cloudflared_unshared; then
-                printf '[提示] cloudflared 疑似被其他隧道使用或检查不完整，已保留。\n'
-                return 0
-            fi
-            rm -f -- /usr/local/bin/cloudflared || return 1
-            rm -f -- "$CONFIG_DIR/.cloudflared-owner" || return 1
-            printf '[完成] 已卸载本脚本安装的 cloudflared。\n' ;;
-        *) printf '[提示] 按照你的选择保留 cloudflared。\n' ;;
-    esac
+    local owner_rc=0
+    cloudflared_owner_valid || owner_rc=$?
+    if [ "$owner_rc" = 2 ]; then return 1; fi
+    if [ "$owner_rc" != 0 ]; then
+        printf '[提示] cloudflared 非本脚本可确认的组件，已保留。\n'
+        return 0
+    fi
+    if ! cloudflared_unshared; then
+        printf '[提示] cloudflared 疑似被其他隧道使用，已保留。\n'
+        return 0
+    fi
+    if ! rm -f -- /usr/local/bin/cloudflared; then
+        printf '[错误] 本脚本安装的 cloudflared 删除失败，归属记录已保留。\n' >&2
+        return 1
+    fi
+    rm -f -- "$CLOUDFLARED_OWNER_FILE" || return 1
+    printf '[完成] 已卸载本脚本安装的 cloudflared。\n'
 }
 ui_line() { printf '%b%s%b\n' "$CYAN" '------------------------------' "$PLAIN"; }
 ui_title() {
