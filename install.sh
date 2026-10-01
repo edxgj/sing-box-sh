@@ -908,7 +908,15 @@ EOF
             fi
         fi
         systemctl daemon-reload || return 1
-        systemctl enable sing-box || return 1
+        # Hide normal symlink notices, but preserve diagnostics on failure.
+        local enable_output enable_rc
+        if enable_output=$(systemctl enable sing-box 2>&1); then
+            :
+        else
+            enable_rc=$?
+            printf '[错误] 设置 sing-box 开机自启失败（退出码 %s）。\n%s\n' "$enable_rc" "$enable_output" >&2
+            return "$enable_rc"
+        fi
         systemctl restart sing-box || return 1
         sleep 2
         if [ "$(systemctl is-active sing-box 2>/dev/null)" != "active" ]; then
