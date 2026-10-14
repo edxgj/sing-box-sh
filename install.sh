@@ -2,7 +2,6 @@
 
 umask 077
 
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -21,8 +20,6 @@ FW_PORTS_FILE="$CONFIG_DIR/.fw_ports"
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
 
-# Run the command in the current shell: transaction state must not be lost.
-# Only the visual indicator runs in the background. No invented percentage.
 SB_PROGRESS_PID=""
 stop_progress() {
     if [ -n "${SB_PROGRESS_PID:-}" ]; then
@@ -69,8 +66,7 @@ cleanup_on_exit() {
     stop_progress
     if [ -n "${CONFIG_TX_DIR:-}" ] && [ "${CONFIG_TX_RECOVERING:-0}" != 1 ]; then
         CONFIG_TX_RECOVERING=1
-        restore_config_and_service || printf '事务恢复失败，备份保留: %s
-' "$CONFIG_TX_DIR" >&2
+        restore_config_and_service || printf '事务恢复失败，备份保留: %s\n' "$CONFIG_TX_DIR" >&2
     fi
     [ -n "$KERNEL_TMP_DIR" ] && rm -rf "$KERNEL_TMP_DIR" 2>/dev/null
     local owned_temp
@@ -209,13 +205,13 @@ JQ_DNS_LOCAL='.dns.servers |= (. // []) |
     .dns.servers += [{"tag": "dns-local", "type": "local"}]
   else . end'
 
-sb_ge_112() {
+sb_bin_ge_112() {
+    local bin="${1:-/usr/local/bin/sing-box}"
     local ver
-    ver=$( ( /usr/local/bin/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    ver=$( ( "$bin" version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     [ -z "$ver" ] && return 1
-    local major
+    local major minor
     major=$(echo "$ver" | cut -d. -f1)
-    local minor
     minor=$(echo "$ver" | cut -d. -f2)
     [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]] || return 1
     [ "$major" -gt 1 ] && return 0
@@ -223,9 +219,79 @@ sb_ge_112() {
     return 1
 }
 
+sb_ge_112() {
+    sb_bin_ge_112 "/usr/local/bin/sing-box"
+}
+
+upgrade_config_schema() {
+    local target_file="${1:-$CONFIG_FILE}"
+    local is_112="${2:-0}"
+    [ -f "$target_file" ] || return 0
+    local tmp
+    tmp=$(mktemp "${target_file}.upg.XXXXXX") || return 1
+    SB_OWNED_TEMP_FILES+=("$tmp")
+    cp -p "$target_file" "$tmp" || { rm -f "$tmp"; return 1; }
+
+    local filter='(.route.rules[]? | select(has("geoip") and .geoip == "private")) |= (del(.geoip) | .ip_is_private = true) |
+      if ((.outbounds? // []) | map(select(.tag=="direct")) | length) == 0 then
+        .outbounds = ((.outbounds // []) + [{"type":"direct","tag":"direct"}])
+      else . end'
+
+    if [ "$is_112" -eq 1 ]; then
+        filter="$filter |
+          (.route.rules[]? | select(.outbound==\"block\")) |= (del(.outbound) | .action=\"reject\") |
+          .outbounds |= map(select(.type!=\"block\")) |
+          if (([.outbounds[]? | select(has(\"domain_strategy\") or has(\"domain_resolver\"))] | length) > 0) then
+            $JQ_DNS_LOCAL |
+            (.outbounds[] | select(has(\"domain_strategy\"))) |= (.domain_resolver = {\"server\": \"dns-local\", \"strategy\": .domain_strategy} | del(.domain_strategy)) |
+            (.outbounds[] | select(has(\"domain_resolver\"))) |= (if (.domain_resolver | type) == \"object\" then (if .domain_resolver.server == null or .domain_resolver.server == \"\" then .domain_resolver.server = \"dns-local\" else . end) else . end)
+          else . end"
+    fi
+
+    if jq "$filter" "$target_file" > "$tmp" &&
+       jq -e 'type == "object" and (.inbounds | type == "array")' "$tmp" >/dev/null &&
+       chmod 600 "$tmp" && mv -f "$tmp" "$target_file"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+check_port_in_config() {
+    local port="$1"
+    local proto="${2:-both}"
+    local exclude_tag="${3:-}"
+    [ -f "$CONFIG_FILE" ] || return 1
+    local existing
+    existing=$(jq -r --argjson p "$port" --arg ex "$exclude_tag" '
+      .inbounds[]?
+      | select(.listen_port == $p and .tag != $ex)
+      | "\(.type)|\(if .transport.type == "ws" then "ws" else "" end)"
+    ' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$existing" ] && return 1
+    local e_type e_ws e_proto
+    while IFS='|' read -r e_type e_ws; do
+        [ -z "$e_type" ] && continue
+        case "$e_type" in
+            hysteria2|tuic) e_proto="udp" ;;
+            anytls|vless)   e_proto="tcp" ;;
+            shadowsocks)    e_proto="both" ;;
+            *)              e_proto="both" ;;
+        esac
+        if [ "$proto" = "both" ] || [ "$e_proto" = "both" ] || [ "$proto" = "$e_proto" ]; then
+            return 0
+        fi
+    done <<< "$existing"
+    return 1
+}
+
 check_port() {
     local port=$1
     local proto=${2:-both}
+    local exclude_tag=${3:-}
+    if check_port_in_config "$port" "$proto" "$exclude_tag"; then
+        return 0
+    fi
     local ss_arg="-tuln"
     [ "$proto" == "tcp" ] && ss_arg="-tln"
     [ "$proto" == "udp" ] && ss_arg="-uln"
@@ -244,7 +310,7 @@ rand_port() {
     local port
     while true; do
         port=$(( ( (RANDOM << 15) | RANDOM ) % 55001 + 10000 ))
-        if ! check_port "$port"; then
+        if ! check_port "$port" "both"; then
             echo "$port"
             break
         fi
@@ -272,6 +338,7 @@ save_secret() {
         printf '%s\n' 'secrets 值包含不支持的换行或单引号，未写入。' >&2
         return 1
     }
+    mkdir -p "$CONFIG_DIR" 2>/dev/null
     touch "$SECRETS_FILE" || return 1
     local tmp
     tmp=$(mktemp "${SECRETS_FILE}.tmp.XXXXXX") || return 1
@@ -304,7 +371,6 @@ remove_secret() {
 
 load_secrets() {
     local line key val
-    # Clear all metadata, including keys removed since the previous load.
     for key in $(compgen -A variable); do
         case "$key" in
             REAL_DOMAIN|SELF_DOMAIN|REAL_CERT_OWNED|INSTALLER_SRC|CERT_TYPE|DOMAIN|ARGO_SERVICES) unset "$key" || return 1 ;;
@@ -403,6 +469,28 @@ register_argo_service() {
     ARGO_SERVICES="$updated"
 }
 
+unregister_argo_service() {
+    local target="$1" svc updated=""
+    local -a registered=()
+    [[ "$target" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || return 1
+    load_secrets || return 1
+    [ -n "${ARGO_SERVICES:-}" ] || return 0
+    IFS=',' read -r -a registered <<< "$ARGO_SERVICES"
+    for svc in "${registered[@]}"; do
+        [ -n "$svc" ] || continue
+        [ "$svc" = "$target" ] && continue
+        updated="${updated:+${updated},}${svc}"
+    done
+    if [ -n "$updated" ]; then
+        save_secret ARGO_SERVICES "$updated" || return 1
+        ARGO_SERVICES="$updated"
+    else
+        remove_secret ARGO_SERVICES || return 1
+        unset ARGO_SERVICES
+    fi
+    return 0
+}
+
 cleanup_node_secrets() {
     local port="$1" type="$2" is_argo="${3:-0}"
     if [ "$is_argo" -eq 1 ]; then
@@ -425,7 +513,7 @@ open_fw_port() {
     local success=0
     local fw_found=0
 
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then
+    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -qw "active"; then
         fw_found=1
         if ufw allow "${port}"/"${proto}" comment 'sb-sh' >/dev/null 2>&1 || ufw allow "${port}"/"${proto}" >/dev/null 2>&1; then
             success=1
@@ -448,7 +536,7 @@ open_fw_port() {
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save >/dev/null 2>&1
         elif command -v iptables-save >/dev/null 2>&1; then
-            mkdir -p /etc/iptables
+            mkdir -p /etc/iptables && chmod 755 /etc/iptables 2>/dev/null
             iptables-save > /etc/iptables/rules.v4 2>/dev/null
             command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
         fi
@@ -484,12 +572,13 @@ close_fw_port() {
         return "$failed"
     fi
 
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw "active"; then
-        printf '保留 UFW 规则 %s/%s：旧记录不能证明归属，请手动核查。\n' "$port" "$proto" >&2
-        return 1
+    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -qw "active"; then
+        ufw delete allow "${port}"/"${proto}" >/dev/null 2>&1 || return 1
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        printf '保留 firewalld 规则 %s/%s：无法确认是否被其他服务共享，请手动核查。\n' "$port" "$proto" >&2
-        return 1
+        if firewall-cmd --query-port="${port}"/"${proto}" --permanent >/dev/null 2>&1; then
+            firewall-cmd --remove-port="${port}"/"${proto}" --permanent >/dev/null 2>&1 &&
+            firewall-cmd --reload >/dev/null 2>&1 || return 1
+        fi
     elif command -v iptables >/dev/null 2>&1; then
         while iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; do
             iptables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || return 1
@@ -502,6 +591,7 @@ close_fw_port() {
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save >/dev/null 2>&1 || return 1
         elif command -v iptables-save >/dev/null 2>&1; then
+            mkdir -p /etc/iptables && chmod 755 /etc/iptables 2>/dev/null
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || return 1
             if command -v ip6tables-save >/dev/null 2>&1; then
                 ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || return 1
@@ -536,20 +626,26 @@ migrate_certs() {
         local kind=self d changed=0 complete=0 f
         [ "${CERT_TYPE:-}" != real ] || kind=real
         [ -f "$CERT_DIR/private.key" ] || { printf '%s\n' '旧证书私钥缺失，取消迁移。' >&2; exit 1; }
-        # Do not overwrite an already existing destination pair.
         for f in "$CERT_DIR/$kind.cer" "$CERT_DIR/$kind.key"; do
             [ ! -e "$f" ] && [ ! -L "$f" ] || { printf '%s\n' '证书迁移目标已存在，保留全部原文件。' >&2; exit 1; }
         done
         d=$(mktemp -d "$CONFIG_DIR/.cert-migrate.XXXXXX") || exit 1
         migration_finish() {
-            local rc=$? failed=0 target tmp
+            local rc=$? failed=0 tmp
             trap - EXIT INT TERM
             if [ "$changed" = 1 ] && [ "$complete" = 0 ]; then
-                for target in config secrets; do
-                    if [ "$target" = config ]; then f="$CONFIG_FILE"; else f="$SECRETS_FILE"; fi
-                    tmp=$(mktemp "${f}.restore.XXXXXX") || { failed=1; continue; }
-                    if ! cp -p "$d/$target" "$tmp" || ! mv -f "$tmp" "$f"; then rm -f "$tmp"; failed=1; fi
-                done
+                tmp=$(mktemp "${CONFIG_FILE}.restore.XXXXXX") || failed=1
+                if [ "$failed" = 0 ]; then
+                    if ! cp -p "$d/config" "$tmp" || ! mv -f "$tmp" "$CONFIG_FILE"; then rm -f "$tmp"; failed=1; fi
+                fi
+                if [ -f "$d/secrets.absent" ]; then
+                    rm -f "$SECRETS_FILE" || failed=1
+                elif [ -f "$d/secrets" ]; then
+                    tmp=$(mktemp "${SECRETS_FILE}.restore.XXXXXX") || failed=1
+                    if [ "$failed" = 0 ]; then
+                        if ! cp -p "$d/secrets" "$tmp" || ! mv -f "$tmp" "$SECRETS_FILE"; then rm -f "$tmp"; failed=1; fi
+                    fi
+                fi
                 cp -p "$d/cert" "$CERT_DIR/fullchain.cer" || failed=1
                 cp -p "$d/key" "$CERT_DIR/private.key" || failed=1
                 if [ "$failed" = 0 ]; then
@@ -563,8 +659,12 @@ migrate_certs() {
         trap migration_finish EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
-        cp -p "$CONFIG_FILE" "$d/config" &&
-        cp -p "$SECRETS_FILE" "$d/secrets" &&
+        cp -p "$CONFIG_FILE" "$d/config" || exit 1
+        if [ -e "$SECRETS_FILE" ]; then
+            cp -p "$SECRETS_FILE" "$d/secrets" || exit 1
+        else
+            touch "$d/secrets.absent" || exit 1
+        fi
         cp -p "$CERT_DIR/fullchain.cer" "$d/cert" &&
         cp -p "$CERT_DIR/private.key" "$d/key" || exit 1
         changed=1
@@ -598,7 +698,6 @@ fetch_url() {
         curl -fsSL --retry 2 --retry-max-time 600 --connect-timeout 15 \
             --max-time 300 -o "$out" "$url" && return 0
     fi
-    # Discard any partial response before the fallback.
     : > "$out" || return 1
     if command -v wget >/dev/null 2>&1; then
         if command -v timeout >/dev/null 2>&1; then
@@ -610,14 +709,12 @@ fetch_url() {
     return 1
 }
 
-
 stop_sing_box_if_present() {
     local state rc
     if [ "$OS_TYPE" = alpine ]; then
         if [ ! -e /etc/init.d/sing-box ] && [ ! -L /etc/init.d/sing-box ]; then return 0; fi
         rc-service sing-box status >/dev/null 2>&1
         rc=$?
-        # OpenRC: 3 means stopped. Other errors must not be hidden.
         [ "$rc" = 3 ] && return 0
         if [ "$rc" != 0 ]; then
             printf '无法确认 sing-box 状态，退出码：%s\n' "$rc" >&2
@@ -646,7 +743,7 @@ install_kernel() {
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || return 1
     (
         umask 077
-        local d newbin active=0 touched=0 done_ok=0
+        local d newbin active=0 touched=0 done_ok=0 new_is_112=0
         mkdir -p /usr/local/bin || exit 1
         d=$(mktemp -d /usr/local/bin/.kernel-tx.XXXXXX) || exit 1
         kernel_tx_finish() {
@@ -654,8 +751,10 @@ install_kernel() {
             stop_progress
             trap - EXIT INT TERM
             if [ "$touched" = 1 ] && [ "$done_ok" = 0 ]; then
-                # Stop a partially started candidate before restoring the old binary.
                 stop_sing_box_if_present || failed=1
+                if [ -f "$d/old_config" ]; then
+                    if ! cp -p "$d/old_config" "$d/restore_cfg" || ! mv -f "$d/restore_cfg" "$CONFIG_FILE"; then failed=1; fi
+                fi
                 if [ -f "$d/old" ]; then
                     if ! cp -p "$d/old" "$d/restore" || ! mv -f "$d/restore" /usr/local/bin/sing-box; then failed=1; fi
                 else
@@ -687,19 +786,27 @@ install_kernel() {
             systemctl is-active --quiet sing-box && active=1
         fi
         if [ -e /usr/local/bin/sing-box ]; then cp -p /usr/local/bin/sing-box "$d/old" || exit 1; fi
+        if [ -f "$CONFIG_FILE" ]; then cp -p "$CONFIG_FILE" "$d/old_config" || exit 1; fi
         run_step "[1/4] 下载 sing-box v${ver} (${SB_ARCH})" fetch_url "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${SB_ARCH}.tar.gz" "$d/archive" || exit 1
         mkdir "$d/extract" || exit 1
-        # Extract only the expected binary, never arbitrary archive paths.
         run_step "[2/4] 解压内核" tar -xzf "$d/archive" -C "$d/extract" "sing-box-${ver}-linux-${SB_ARCH}/sing-box" || exit 1
         newbin="$d/extract/sing-box-${ver}-linux-${SB_ARCH}/sing-box"
         [ -f "$newbin" ] && [ ! -L "$newbin" ] && chown 0:0 "$newbin" && chmod 755 "$newbin" || exit 1
         run_step "[3/4] 验证内核运行" "$newbin" version || exit 1
-        if [ "$mode" != norestart ] && [ -f "$CONFIG_FILE" ]; then run_step "检查现有配置兼容性" "$newbin" check -c "$CONFIG_FILE" || exit 1; fi
+        sb_bin_ge_112 "$newbin" && new_is_112=1
+        if [ "$mode" != norestart ] && [ -f "$CONFIG_FILE" ]; then
+            cp -p "$CONFIG_FILE" "$d/test_config.json" || exit 1
+            upgrade_config_schema "$d/test_config.json" "$new_is_112" || exit 1
+            run_step "检查现有配置兼容性" "$newbin" check -c "$d/test_config.json" || exit 1
+        fi
         touched=1
         if [ "$active" = 1 ]; then
             if [ "$OS_TYPE" = alpine ]; then run_step "停止旧内核" rc-service sing-box stop || exit 1; else run_step "停止旧内核" systemctl stop sing-box || exit 1; fi
         fi
         run_step "[4/4] 安装内核" mv -f "$newbin" /usr/local/bin/sing-box || exit 1
+        if [ -f "$d/test_config.json" ]; then
+            mv -f "$d/test_config.json" "$CONFIG_FILE" || exit 1
+        fi
         if [ "$mode" != norestart ]; then run_step "启动并检查服务" restart_service || exit 1; fi
         done_ok=1
         printf '==> 内核 v%s 安装完毕！\n' "$ver"
@@ -784,7 +891,7 @@ init_base() {
         KERNEL_REINSTALLED=1
     fi
 
-    mkdir -p $CONFIG_DIR $CERT_DIR || return 1
+    mkdir -p "$CONFIG_DIR" "$CERT_DIR" || return 1
     
     if [ -f "$CONFIG_FILE" ]; then
         if ! jq -e '.inbounds | type == "array"' "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -802,32 +909,18 @@ init_base() {
         fi
     fi
     
+    local is_112=0
+    sb_ge_112 && is_112=1
+
     if [ ! -f "$CONFIG_FILE" ]; then
-        if sb_ge_112; then
-            echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[{"ip_is_private":true,"action":"reject"}]}}' > $CONFIG_FILE
+        if [ "$is_112" -eq 1 ]; then
+            echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[{"ip_is_private":true,"action":"reject"}]}}' > "$CONFIG_FILE"
         else
-            echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > $CONFIG_FILE
+            echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"route":{"rules":[{"ip_is_private":true,"outbound":"block"}]}}' > "$CONFIG_FILE"
         fi
+        chmod 600 "$CONFIG_FILE"
     else
-        apply_jq_config '(.route.rules[] | select(has("geoip") and .geoip == "private")) |= (del(.geoip) | .ip_is_private = true)' >/dev/null 2>&1
-        
-        if ! jq -e '.outbounds? // [] | map(select(.tag=="direct")) | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
-            apply_jq_config '.outbounds = ((.outbounds // []) + [{"type":"direct","tag":"direct"}])' >/dev/null 2>&1
-        fi
-        
-        if sb_ge_112; then
-            if grep -q '"block"' $CONFIG_FILE; then
-                apply_jq_config '(.route.rules[]? | select(.outbound=="block")) |= (del(.outbound) | .action="reject") | .outbounds |= map(select(.type!="block"))' >/dev/null 2>&1
-            fi
-            
-            if grep -q '"domain_strategy"' $CONFIG_FILE || grep -q '"domain_resolver"' $CONFIG_FILE; then
-                apply_jq_config "
-                  $JQ_DNS_LOCAL |
-                  (.outbounds[] | select(has(\"domain_strategy\"))) |= (.domain_resolver = {\"server\": \"dns-local\", \"strategy\": .domain_strategy} | del(.domain_strategy)) |
-                  (.outbounds[] | select(has(\"domain_resolver\"))) |= (if (.domain_resolver | type) == \"object\" then (if .domain_resolver.server == null or .domain_resolver.server == \"\" then .domain_resolver.server = \"dns-local\" else . end) else . end)
-                " >/dev/null 2>&1
-            fi
-        fi
+        upgrade_config_schema "$CONFIG_FILE" "$is_112" >/dev/null 2>&1
     fi
     migrate_certs || return 1
 
@@ -858,7 +951,7 @@ restart_service() {
         return 0
     fi
 
-    if ! /usr/local/bin/sing-box check -c $CONFIG_FILE; then return 1; fi
+    if ! /usr/local/bin/sing-box check -c "$CONFIG_FILE"; then return 1; fi
     
     if [ "$OS_TYPE" == "alpine" ]; then
         if [ ! -e "/etc/init.d/sing-box" ] && [ ! -L "/etc/init.d/sing-box" ]; then
@@ -908,7 +1001,6 @@ EOF
             fi
         fi
         systemctl daemon-reload || return 1
-        # Hide normal symlink notices, but preserve diagnostics on failure.
         local enable_output enable_rc
         if enable_output=$(systemctl enable sing-box 2>&1); then
             :
@@ -936,9 +1028,13 @@ get_domain() {
     
     local val
     while true; do
-        ask "$prompt [默认: $default]: " val
-        val=${val:-$default}
-        if [[ "$val" =~ $pattern ]] && [[ "$val" =~ [a-zA-Z0-9] ]]; then
+        if [ -n "$default" ]; then
+            ask "$prompt [默认: $default]: " val
+            val=${val:-$default}
+        else
+            ask "$prompt: " val
+        fi
+        if [[ "$val" =~ $pattern ]] && [[ "$val" =~ [a-zA-Z0-9] ]] && [[ "$val" != .* ]] && [[ "$val" != *..* ]]; then
             break
         else
             if [ "$allow_colon" == "true" ]; then
@@ -950,7 +1046,6 @@ get_domain() {
     done
     printf '%s\n' "$val"
 }
-
 
 confirm_http01_ready() {
     local confirmed=""
@@ -974,7 +1069,6 @@ ensure_acme_installed() {
     SB_OWNED_TEMP_FILES+=("$installer")
     if ! curl -fL --connect-timeout 15 --max-time 120 --retry 2 \
         -o "$installer" https://get.acme.sh; then
-        # Discard any partial curl output before trying the fallback.
         : > "$installer"
         wget -T 30 -O "$installer" https://get.acme.sh || failed=1
     fi
@@ -994,6 +1088,29 @@ ensure_acme_installed() {
     fi
     return 0
 }
+
+cert_remaining_days() {
+    local cert="$1" raw_end iso_end end_ts
+    command -v openssl >/dev/null 2>&1 || return 1
+    raw_end=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+    [ -n "$raw_end" ] || return 1
+    end_ts=$(date -d "$raw_end" +%s 2>/dev/null) || end_ts=""
+    if [ -z "$end_ts" ]; then
+        iso_end=$(printf '%s\n' "$raw_end" | awk '
+            BEGIN {
+                m["Jan"]="01"; m["Feb"]="02"; m["Mar"]="03"; m["Apr"]="04";
+                m["May"]="05"; m["Jun"]="06"; m["Jul"]="07"; m["Aug"]="08";
+                m["Sep"]="09"; m["Oct"]="10"; m["Nov"]="11"; m["Dec"]="12";
+            }
+            {
+                if ($1 in m) printf "%04d-%s-%02d %s", $4, m[$1], $2, $3
+            }')
+        [ -n "$iso_end" ] && end_ts=$(date -u -d "$iso_end" +%s 2>/dev/null)
+    fi
+    [ -n "$end_ts" ] || return 1
+    printf '%d\n' $(( (end_ts - $(date +%s)) / 86400 ))
+}
+
 apply_real_cert() {
     local NEW_DOMAIN
     NEW_DOMAIN=$(get_domain "请输入解析到本机的域名" "") || exit 1
@@ -1013,13 +1130,10 @@ apply_real_cert() {
         [ -n "$exist_cer" ] && had_prior=1
         if [ -n "$exist_cer" ]; then
             local left_days=""
-            if command -v openssl >/dev/null 2>&1; then
-                local end_ts
-                end_ts=$(date -d "$(openssl x509 -in "$exist_cer" -noout -enddate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null)
-                [ -n "$end_ts" ] && left_days=$(( (end_ts - $(date +%s)) / 86400 ))
-            fi
-            if [ -n "$left_days" ] && [ "$left_days" -gt 7 ]; then
-                echo -e "\n${GREEN}检测到 ${NEW_DOMAIN} 已有有效证书，剩余 ${left_days} 天。${PLAIN}"
+            left_days=$(cert_remaining_days "$exist_cer") || left_days=""
+            if { [ -n "$left_days" ] && [ "$left_days" -gt 7 ]; } ||
+               { [ -z "$left_days" ] && openssl x509 -in "$exist_cer" -noout -checkend 604800 >/dev/null 2>&1; }; then
+                echo -e "\n${GREEN}检测到 ${NEW_DOMAIN} 已有有效证书，剩余 ${left_days:-大于7} 天。${PLAIN}"
                 echo -e "${YELLOW}[提示] Let's Encrypt 对同一域名限制 168 小时内最多签发 5 次，建议直接复用。${PLAIN}"
                 ask "是否复用现有证书？(y/n) [默认: y]: " ru
                 [[ "${ru:-y}" == "y" || "${ru:-y}" == "Y" ]] && reuse=1
@@ -1028,52 +1142,50 @@ apply_real_cert() {
     fi
 
     if [ "$reuse" -eq 0 ]; then
-    echo -e "\n请选择验证方式:"
-    echo -e " 1) 80端口独立申请 - 需确保服务器80端口开放且未被占用"
-    echo -e " 2) Cloudflare DNS API - 推荐，适合各类环境"
-    local v_mode
-    while true; do
-        ask "请选择 [1-2]: " v_mode
-        if [[ "$v_mode" == "1" || "$v_mode" == "2" ]]; then break; fi
-    done
-
-    ensure_acme_installed || return 1
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
-
-    if [ "$v_mode" == "1" ]; then
-        if ! confirm_http01_ready; then
-            return 1
-        fi
-        local issue_ok=1
-        if ! ~/.acme.sh/acme.sh --issue -d "${NEW_DOMAIN}" --standalone --force; then
-            issue_ok=0
-        fi
-        # Firewall access is maintained by the administrator for future renewals.
-        # Never remove existing rules or create a temporary-only allowance here.
-        if [ "$issue_ok" -eq 0 ]; then
-            echo -e "${RED}[错误] 申请失败！请检查域名解析和 80 端口是否连通。${PLAIN}"
-            return 1
-        fi
-    else
-        local NEW_CF_Key=""
+        echo -e "\n请选择验证方式:"
+        echo -e " 1) 80端口独立申请 - 需确保服务器80端口开放且未被占用"
+        echo -e " 2) Cloudflare DNS API - 推荐，适合各类环境"
+        local v_mode
         while true; do
-            ask "请输入 Cloudflare Global API Key: " NEW_CF_Key
-            if [[ "$NEW_CF_Key" =~ ^[A-Za-z0-9]+$ ]]; then break; fi
-            echo -e "${RED}[错误] 错误：API Key 格式不正确！${PLAIN}" >&2
+            ask "请选择 [1-2]: " v_mode
+            if [[ "$v_mode" == "1" || "$v_mode" == "2" ]]; then break; fi
         done
-        
-        local NEW_CF_Email=""
-        while true; do
-            ask "请输入 Cloudflare 邮箱: " NEW_CF_Email
-            if [[ "$NEW_CF_Email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then break; fi
-            echo -e "${RED}[错误] 错误：邮箱格式不正确，请重新输入！${PLAIN}" >&2
-        done
-        
-        if ! CF_Key="${NEW_CF_Key}" CF_Email="${NEW_CF_Email}" ~/.acme.sh/acme.sh --issue --dns dns_cf -d "${NEW_DOMAIN}" --force; then
-            echo -e "${RED}[错误] 申请失败！请检查 CF API 是否正确，或该域名已达 Let's Encrypt 签发频率上限。${PLAIN}"
-            return 1
+
+        ensure_acme_installed || return 1
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+
+        if [ "$v_mode" == "1" ]; then
+            if ! confirm_http01_ready; then
+                return 1
+            fi
+            local issue_ok=1
+            if ! ~/.acme.sh/acme.sh --issue -d "${NEW_DOMAIN}" --standalone --force; then
+                issue_ok=0
+            fi
+            if [ "$issue_ok" -eq 0 ]; then
+                echo -e "${RED}[错误] 申请失败！请检查域名解析和 80 端口是否连通。${PLAIN}"
+                return 1
+            fi
+        else
+            local NEW_CF_Key=""
+            while true; do
+                ask "请输入 Cloudflare Global API Key: " NEW_CF_Key
+                if [[ "$NEW_CF_Key" =~ ^[A-Za-z0-9]+$ ]]; then break; fi
+                echo -e "${RED}[错误] 错误：API Key 格式不正确！${PLAIN}" >&2
+            done
+            
+            local NEW_CF_Email=""
+            while true; do
+                ask "请输入 Cloudflare 邮箱: " NEW_CF_Email
+                if [[ "$NEW_CF_Email" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then break; fi
+                echo -e "${RED}[错误] 错误：邮箱格式不正确，请重新输入！${PLAIN}" >&2
+            done
+            
+            if ! CF_Key="${NEW_CF_Key}" CF_Email="${NEW_CF_Email}" ~/.acme.sh/acme.sh --issue --dns dns_cf -d "${NEW_DOMAIN}" --force; then
+                echo -e "${RED}[错误] 申请失败！请检查 CF API 是否正确，或该域名已达 Let's Encrypt 签发频率上限。${PLAIN}"
+                return 1
+            fi
         fi
-    fi
     fi
     
     deploy_real_cert "$NEW_DOMAIN" "$had_prior" || return 1
@@ -1081,13 +1193,12 @@ apply_real_cert() {
     return 0
 }
 
-
 deploy_real_cert() {
     local domain="$1" had_prior="$2"
     [[ "$domain" =~ ^[A-Za-z0-9.-]+$ && "$domain" != .* && "$domain" != *..* ]] || return 1
     (
         umask 077
-        local stage changed=0 completed=0 active=0 reload name target i
+        local stage changed=0 completed=0 active=0 reload target i
         local -a targets=()
         stage=$(mktemp -d "$CERT_DIR/.real-deploy.XXXXXX") || exit 1
         targets=("$CERT_DIR/real.cer" "$CERT_DIR/real.key" "$SECRETS_FILE"
@@ -1095,10 +1206,10 @@ deploy_real_cert() {
                  "$HOME/.acme.sh/${domain}_ecc/$domain.conf")
         if [ "$OS_TYPE" = alpine ]; then
             rc-service sing-box status >/dev/null 2>&1 && active=1
-            reload="rc-service sing-box restart >/dev/null 2>&1"
+            reload="if [ -e /etc/init.d/sing-box ] && rc-service sing-box status >/dev/null 2>&1; then rc-service sing-box restart >/dev/null 2>&1; fi"
         else
-            systemctl is-active --quiet sing-box && active=1
-            reload="systemctl restart sing-box >/dev/null 2>&1"
+            systemctl is-active --quiet sing-box 2>/dev/null && active=1
+            reload="if systemctl is-active --quiet sing-box 2>/dev/null; then systemctl restart sing-box >/dev/null 2>&1; fi"
         fi
         real_restore_one() {
             local index="$1" path="$2" tmp
@@ -1113,12 +1224,11 @@ deploy_real_cert() {
             if [ "$changed" = 1 ] && [ "$completed" = 0 ]; then
                 for j in "${!targets[@]}"; do real_restore_one "$j" "${targets[$j]}" || failed=1; done
                 if [ "$failed" = 0 ]; then
-                    if [ "$OS_TYPE" = alpine ]; then
-                        if [ "$active" = 1 ]; then rc-service sing-box restart || failed=1
-                        else rc-service sing-box stop || failed=1; fi
+                    if [ "$active" = 1 ]; then
+                        if [ "$OS_TYPE" = alpine ]; then rc-service sing-box restart || failed=1
+                        else systemctl restart sing-box || failed=1; fi
                     else
-                        if [ "$active" = 1 ]; then systemctl restart sing-box || failed=1
-                        else systemctl stop sing-box || failed=1; fi
+                        stop_sing_box_if_present || failed=1
                     fi
                 fi
             fi
@@ -1134,7 +1244,6 @@ deploy_real_cert() {
         trap 'exit 143' TERM
         for i in "${!targets[@]}"; do
             target="${targets[$i]}"
-            # Do not replace a symlink with a regular file during rollback.
             [ ! -L "$target" ] || exit 1
             if [ -e "$target" ]; then
                 [ -f "$target" ] && cp -p "$target" "$stage/$i" || exit 1
@@ -1640,11 +1749,10 @@ warn_port_shared() {
         local o_proto=""
         case "$o_type" in
             hysteria2|tuic) o_proto="udp" ;;
-            anytls)         o_proto="tcp" ;;
+            anytls|vless)   o_proto="tcp" ;;
             shadowsocks)    o_proto="both" ;;
-            vless)          [ "$o_ws" != "ws" ] && o_proto="tcp" ;;
         esac
-        if [ -n "$o_proto" ] && [ "$o_proto" != "$proto" ]; then
+        if [ -n "$o_proto" ] && [ "$o_proto" != "both" ] && [ "$proto" != "both" ] && [ "$o_proto" != "$proto" ]; then
             echo -e "\n${YELLOW}提示: 端口 ${port} 已被节点 ${o_tag} 使用 (${o_proto^^})，本节点用的是 ${proto^^}。${PLAIN}"
             echo -e "${YELLOW}[提示] 内核允许 TCP/UDP 同号共存，但请确认防火墙与云服务商/NAT 端口映射${PLAIN}"
             echo -e "${YELLOW}[提示] 对 ${proto^^} 和 ${o_proto^^} 两种协议都放行了 ${port}，否则其中一个节点会连不上。${PLAIN}"
@@ -1680,9 +1788,11 @@ add_config() {
         local PORT
         
         local f_proto=""
-        if [[ "$proto_idx" == "1" || "$proto_idx" == "4" ]]; then f_proto="tcp"
-        elif [[ "$proto_idx" == "2" || "$proto_idx" == "3" ]]; then f_proto="udp"
-        elif [ "$proto_idx" == "6" ]; then f_proto="both"
+        local check_proto="tcp"
+        if [[ "$proto_idx" == "1" || "$proto_idx" == "4" ]]; then f_proto="tcp"; check_proto="tcp"
+        elif [[ "$proto_idx" == "2" || "$proto_idx" == "3" ]]; then f_proto="udp"; check_proto="udp"
+        elif [ "$proto_idx" == "5" ]; then f_proto=""; check_proto="tcp"
+        elif [ "$proto_idx" == "6" ]; then f_proto="both"; check_proto="both"
         fi
 
         while true; do
@@ -1691,13 +1801,13 @@ add_config() {
             if ! [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
                 echo -e "${RED}[错误] 端口必须为 1-65535 之间的数字${PLAIN}"; continue
             fi
-            if check_port "$PORT" "$f_proto"; then
+            if check_port "$PORT" "$check_proto"; then
                 echo -e "${RED}[错误] 错误! 端口 ${PORT} 已被占用！${PLAIN}"; continue
             fi
             break
         done
         echo -e "使用: ${GREEN}${PORT}${PLAIN}"
-        warn_port_shared "$PORT" "$f_proto"
+        warn_port_shared "$PORT" "$check_proto"
         
         local raw_hostname
         raw_hostname=$(hostname 2>/dev/null || echo "vps")
@@ -1737,8 +1847,6 @@ add_config() {
             fi
         fi
 
-        # Certificate deployment is an independent transaction. Snapshot node
-        # metadata only after it finishes, so a node rollback cannot undo it.
         case "$proto_idx" in
             2|3|4) prompt_cert_type || continue ;;
         esac
@@ -1768,8 +1876,6 @@ add_config() {
             2)
                 local PASS
                 PASS=$(get_pass) || exit 1
-                # Certificate paths were selected before backup_config.
-                
                 apply_jq_config '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' \
                 --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
                 ;;
@@ -1778,16 +1884,12 @@ add_config() {
                 UUID=$(get_uuid) || exit 1
                 local PASS
                 PASS=$(get_pass) || exit 1
-                # Certificate paths were selected before backup_config.
-                
                 apply_jq_config '.inbounds += [{"type":"tuic","tag":$tag,"listen":"::","listen_port":$p,"users":[{"uuid":$uuid,"password":$pass}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' \
                 --argjson p "$PORT" --arg uuid "$UUID" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
                 ;;
             4)
                 local PASS
                 PASS=$(get_pass) || exit 1
-                # Certificate paths were selected before backup_config.
-                
                 apply_jq_config '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h2","http/1.1"],"certificate_path":$cert,"key_path":$key}}]' \
                 --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
                 ;;
@@ -1835,7 +1937,6 @@ add_config() {
                                 rm -f "$TMP_CF"
                                 CF_FAILED=1
                             elif [ -e "$TMP_CF" ]; then
-                                # Destination appeared concurrently; never claim it.
                                 rm -f "$TMP_CF"
                                 CF_FAILED=1
                             else
@@ -1848,8 +1949,6 @@ add_config() {
                         fi
                     fi
                     
-                    # Restrict paths interpolated into service files and sed.
-                    # Reject shell functions, relative paths and unsafe characters.
                     if [[ ! "$CF_BIN" =~ ^/[A-Za-z0-9_./-]+$ ]] ||
                        [ ! -f "$CF_BIN" ] || [ ! -x "$CF_BIN" ]; then
                         echo 'cloudflared 路径无效，拒绝创建服务。' >&2
@@ -1885,13 +1984,13 @@ EOF
                         fi
                         sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/init.d/cloudflared-${TAG}" &&
                         sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/init.d/cloudflared-${TAG}" &&
-                        chmod 700 "/etc/init.d/cloudflared-${TAG}" &&
+                        chmod 755 "/etc/init.d/cloudflared-${TAG}" &&
                         rc-update add "cloudflared-${TAG}" default >/dev/null 2>&1 &&
                         rc-service "cloudflared-${TAG}" restart >/dev/null 2>&1 &&
                         rc-service "cloudflared-${TAG}" status >/dev/null 2>&1 &&
                         register_argo_service "cloudflared-${TAG}" || CF_FAILED=1
                     elif [ "${CF_FAILED:-0}" -eq 0 ]; then
-                        ( umask 077; cat > "/etc/systemd/system/cloudflared-${TAG}.service" << 'EOF'
+                        ( umask 022; cat > "/etc/systemd/system/cloudflared-${TAG}.service" << 'EOF'
 [Unit]
 Description=cloudflared tunnel for @@SB_TAG@@
 After=network.target
@@ -1910,7 +2009,7 @@ EOF
                         fi
                         sed -i "s|@@SB_TAG@@|${TAG}|g" "/etc/systemd/system/cloudflared-${TAG}.service" &&
                         sed -i "s|@@SB_TOKEN@@|${ARGO_TOKEN}|g" "/etc/systemd/system/cloudflared-${TAG}.service" &&
-                        chmod 600 "/etc/systemd/system/cloudflared-${TAG}.service" &&
+                        chmod 644 "/etc/systemd/system/cloudflared-${TAG}.service" &&
                         systemctl daemon-reload >/dev/null 2>&1 &&
                         systemctl enable "cloudflared-${TAG}" --now >/dev/null 2>&1 &&
                         systemctl is-active --quiet "cloudflared-${TAG}" &&
@@ -1920,7 +2019,6 @@ EOF
                         echo -e "${YELLOW}[提示] 请检查组件下载、可执行路径及运行环境后重试。${PLAIN}"
                     fi
                     if [ "$CF_FAILED" -ne 0 ]; then
-                        # Preserve metadata and backup when service cleanup fails.
                         if ! cleanup_created_argo_service "$TAG"; then
                             echo '隧道清理失败，停止操作；请检查服务与事务备份。' >&2
                             return 1
@@ -1948,7 +2046,6 @@ EOF
                 --argjson p "$PORT" --arg m "$SS_METHOD" --arg pass "$PASS" --arg tag "$TAG" || jq_ok=0
                 ;;
         esac
-        
 
         if [ "$jq_ok" -eq 0 ]; then
             restore_config_and_service || return 1
@@ -2032,8 +2129,7 @@ modify_config() {
                             *) echo -e "${RED}[错误] 错误!${PLAIN}" ;; 
                         esac
                     else
-                    local mod_idx
-                    ask "请选择 [0-3]: " mod_idx
+                        ask "请选择 [0-3]: " mod_idx
                         case "$mod_idx" in 
                             1) action="uuid"; break ;; 
                             2) action="port"; break ;; 
@@ -2090,7 +2186,7 @@ modify_config() {
                 if [ "$action" == "uuid" ]; then NEW_AUTH=$(get_uuid) || exit 1
                 elif [ "$TYPE" == "shadowsocks" ]; then
                     local SS_METHOD_CUR
-                    SS_METHOD_CUR=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .method // ""' $CONFIG_FILE)
+                    SS_METHOD_CUR=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .method // ""' "$CONFIG_FILE")
                     local SS_DEFAULT_PASS
                     SS_DEFAULT_PASS=$(get_ss_password "$SS_METHOD_CUR")
                     while true; do
@@ -2105,7 +2201,7 @@ modify_config() {
                 
                 if [ "$action" == "uuid" ]; then
                     if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .users[0].uuid) = $auth' --arg tag "$TAG" --arg auth "$NEW_AUTH"; then
-                        commit_config || return 1
+                        restore_config_and_service || return 1
                         pause
                         continue
                     fi
@@ -2113,7 +2209,7 @@ modify_config() {
                     local PASS_FILTER='(.inbounds[] | select(.tag==$tag) | .users[0].password) = $auth'
                     if [ "$TYPE" == "shadowsocks" ]; then PASS_FILTER='(.inbounds[] | select(.tag==$tag) | .password) = $auth'; fi
                     if ! apply_jq_config "$PASS_FILTER" --arg tag "$TAG" --arg auth "$NEW_AUTH"; then
-                        commit_config || return 1
+                        restore_config_and_service || return 1
                         pause
                         continue
                     fi
@@ -2127,11 +2223,10 @@ modify_config() {
                 pause
                 
             elif [ "$action" == "cert" ]; then
-                # Paths were selected before the node transaction began.
                 if [ -s "$SEL_CERT" ] && [ -s "$SEL_KEY" ]; then
                     if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tls.certificate_path) = $cert | (.inbounds[] | select(.tag==$tag) | .tls.key_path) = $key' \
                     --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY"; then
-                        commit_config || return 1
+                        restore_config_and_service || return 1
                         pause
                         continue
                     fi
@@ -2142,20 +2237,22 @@ modify_config() {
                         echo -e "${GREEN}[完成] 节点 $TAG 的证书已更新！${PLAIN}"; commit_config || return 1
                     fi
                 else
-                    commit_config || return 1
+                    restore_config_and_service || return 1
                 fi
                 pause
                 
             elif [ "$action" == "port" ]; then
                 local f_proto=""
+                local check_proto="tcp"
                 local IS_ARGO=0
-                if [[ "$TYPE" == "vless" && "$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type // empty' $CONFIG_FILE)" != "ws" ]]; then f_proto="tcp"
-                elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "tuic" ]]; then f_proto="udp"
-                elif [ "$TYPE" == "anytls" ]; then f_proto="tcp"
-                elif [ "$TYPE" == "shadowsocks" ]; then f_proto="both"
+                if [[ "$TYPE" == "vless" && "$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type // empty' "$CONFIG_FILE")" != "ws" ]]; then f_proto="tcp"; check_proto="tcp"
+                elif [[ "$TYPE" == "vless" ]]; then f_proto=""; check_proto="tcp"; IS_ARGO=1
+                elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "tuic" ]]; then f_proto="udp"; check_proto="udp"
+                elif [ "$TYPE" == "anytls" ]; then f_proto="tcp"; check_proto="tcp"
+                elif [ "$TYPE" == "shadowsocks" ]; then f_proto="both"; check_proto="both"
                 fi
 
-                if jq -e --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type=="ws"' $CONFIG_FILE >/dev/null 2>&1; then
+                if [ "$IS_ARGO" -eq 1 ]; then
                     echo -e "\n${YELLOW}注意: 这是 Argo 节点，入口由 Cloudflare Tunnel 提供。${PLAIN}"
                     echo -e "${YELLOW}[提示] 改完本地端口后，必须去 Cloudflare Zero Trust 后台把该 Tunnel 的${PLAIN}"
                     echo -e "${YELLOW}[提示] Public Hostname (Ingress) 目标同步改成 localhost:<新端口>，${PLAIN}"
@@ -2174,13 +2271,13 @@ modify_config() {
                     ask "请输入新端口 [默认随机]: " NEW_PORT
                     NEW_PORT=${NEW_PORT:-$(rand_port)}
                     if ! [[ "$NEW_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then echo -e "${RED}[错误] 错误输入!${PLAIN}"; continue; fi
-                    if [ "$NEW_PORT" != "$OLD_PORT" ] && check_port "$NEW_PORT" "$f_proto"; then echo -e "${RED}[错误] 端口占用!${PLAIN}"; continue; fi
+                    if [ "$NEW_PORT" != "$OLD_PORT" ] && check_port "$NEW_PORT" "$check_proto" "$TAG"; then echo -e "${RED}[错误] 端口占用!${PLAIN}"; continue; fi
                     break
                 done
-                warn_port_shared "$NEW_PORT" "$f_proto" "$TAG"
+                warn_port_shared "$NEW_PORT" "$check_proto" "$TAG"
                 
                 if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .listen_port) = $p' --arg tag "$TAG" --argjson p "$NEW_PORT"; then
-                    commit_config || return 1
+                    restore_config_and_service || return 1
                     pause
                     continue
                 fi
@@ -2257,7 +2354,7 @@ modify_config() {
                 [ "$IS_ARGO" == "ws" ] && IS_ARGO=1 || IS_ARGO=0
                 
                 if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tag) = $newtag' --arg tag "$TAG" --arg newtag "$NEW_TAG"; then
-                    commit_config || return 1
+                    restore_config_and_service || return 1
                     pause
                     continue
                 fi
@@ -2285,7 +2382,7 @@ modify_config() {
                 
                 if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tls.server_name) = $sni | (.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server) = $sni' \
                 --arg tag "$TAG" --arg sni "$NEW_SNI"; then
-                    commit_config || return 1
+                    restore_config_and_service || return 1
                     pause
                     continue
                 fi
@@ -2310,9 +2407,9 @@ del_config() {
         select_inbound || return
         
         local TYPE
-        TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' $CONFIG_FILE)
+        TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' "$CONFIG_FILE")
         local PORT
-        PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port' $CONFIG_FILE)
+        PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port' "$CONFIG_FILE")
         local IS_ARGO
         IS_ARGO=$(jq -r --arg tag "$TAG" '[.inbounds[] | select(.tag==$tag) | .transport.type] | .[0] // ""' "$CONFIG_FILE" 2>/dev/null)
         [ "$IS_ARGO" == "ws" ] && IS_ARGO=1 || IS_ARGO=0
@@ -2320,7 +2417,7 @@ del_config() {
         backup_config || return 1
         
         if ! apply_jq_config 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$TAG"; then
-            commit_config || return 1
+            restore_config_and_service || return 1
             pause
             continue
         fi
@@ -2328,6 +2425,12 @@ del_config() {
         if ! cleanup_node_secrets "$PORT" "$TYPE" "$IS_ARGO"; then
             restore_config_and_service || return 1
             return 1
+        fi
+        if [ "$IS_ARGO" -eq 1 ]; then
+            if ! unregister_argo_service "cloudflared-${TAG}"; then
+                restore_config_and_service || return 1
+                return 1
+            fi
         fi
         if ! restart_service; then
             echo -e "${RED}[错误] 删除失败：配置还原，内核未能正常重启！${PLAIN}"
@@ -2354,21 +2457,17 @@ del_config() {
         fi
         
         if [ "$IS_ARGO" -eq 1 ]; then
+            stop_managed_service "cloudflared-${TAG}" >/dev/null 2>&1 || :
             if [ "$OS_TYPE" == "alpine" ]; then
-                rc-service "cloudflared-${TAG}" stop >/dev/null 2>&1
-                rc-update del "cloudflared-${TAG}" default >/dev/null 2>&1
                 rm -f "/etc/init.d/cloudflared-${TAG}"
             else
-                systemctl stop "cloudflared-${TAG}" >/dev/null 2>&1
-                systemctl disable "cloudflared-${TAG}" >/dev/null 2>&1
                 rm -f "/etc/systemd/system/cloudflared-${TAG}.service"
                 systemctl daemon-reload >/dev/null 2>&1
             fi
         fi
         
-        
         local INBOUND_COUNT
-        INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE)
+        INBOUND_COUNT=$(jq '.inbounds | length' "$CONFIG_FILE")
         if [ "$INBOUND_COUNT" -eq 0 ]; then
             echo -e "${GREEN}[完成] 配置 $TAG 已删除！检测到已无节点，内核已自动停止。${PLAIN}"
         else
@@ -2404,7 +2503,6 @@ show_all_links() {
         IP=$(get_ip)
         for TAG in "${TAGS[@]}"; do
             build_share_url "$TAG" "$IP"
-            # A real blank line separates URLs even in terminal selections.
             printf '\n'
         done
     fi
@@ -2445,7 +2543,7 @@ run_manage() {
                        pause; break
                    fi
                    local INBOUND_COUNT
-                   INBOUND_COUNT=$(jq '.inbounds | length' $CONFIG_FILE 2>/dev/null)
+                   INBOUND_COUNT=$(jq '.inbounds | length' "$CONFIG_FILE" 2>/dev/null)
                    if [ -z "$INBOUND_COUNT" ] || [ "$INBOUND_COUNT" -eq 0 ]; then echo -e "${RED}[错误] 未添加节点配置！${PLAIN}"; pause; break; fi
                    if ! restart_service; then
                        echo -e "${RED}[错误] 操作失败！内核启动失败，请检查配置。${PLAIN}"
@@ -2507,11 +2605,12 @@ update_manage() {
                     pause; break ;;
                 2)
                     echo -e "\n${CYAN}正在拉取最新脚本代码...${PLAIN}"
-                    if fetch_script "${BASH_SOURCE[0]}"; then
+                    if fetch_script; then
                         echo -e "${GREEN}[完成] 脚本代码更新成功！请重新运行 sb 命令。${PLAIN}"
                         exit 0
                     else
                         echo -e "${RED}[错误] 下载脚本失败或内容校验不通过！更新中止。${PLAIN}"
+                        pause; break
                     fi
                     ;;
                 3)
@@ -2538,9 +2637,6 @@ update_manage() {
     done
 }
 
-
-# Keep recovery state outside CONFIG_DIR so uninstall/declining restore
-# never destroys the original values.
 BBR_STATE_DIR="/var/lib/sing-box-manager/bbr"
 BBR_SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
 CLOUDFLARED_OWNER_FILE="/var/lib/sing-box-manager/cloudflared-owner"
@@ -2566,7 +2662,7 @@ bbr_rollback_runtime() {
     fi
     return "$failed"
 }
-# Conservative scan: any external definition is shown, never silently overwritten.
+
 bbr_check_conflicts() {
     local f dir rc failed=0
     local pattern='^[[:space:]]*-?[[:space:]]*net[./](core[./]default_qdisc|ipv4[./]tcp_congestion_control)[[:space:]]*='
@@ -2668,7 +2764,7 @@ enable_bbr() {
             local rebuild
             ask "BBR+FQ 配置缺失，是否按有效记录重建？[y/N]: " rebuild
             case "$rebuild" in y|Y) ;; *) pause; return 0 ;; esac
-            if ! (set -C; cat "$BBR_STATE_DIR/managed.conf" > "$BBR_SYSCTL_FILE"); then
+            if ! (set -C; cat "$BBR_STATE_DIR/managed.conf" > "$BBR_SYSCTL_FILE") || ! chmod 644 "$BBR_SYSCTL_FILE"; then
                 printf '[错误] 无法重建 BBR+FQ 持久化配置。\n' >&2
                 pause
                 return 1
@@ -2695,9 +2791,6 @@ enable_bbr() {
         pause
         return 1
     fi
-    # Even if BBR/FQ is already active, continue to create a managed
-    # persistent config and save the actual pre-change values.
-    # Leave all pre-existing persistent settings untouched.
     if [ -f /etc/sysctl.conf ] &&
        grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' /etc/sysctl.conf; then
         printf '[提示] /etc/sysctl.conf 已定义相关参数，请先处理冲突；未修改原文件。\n'
@@ -2706,6 +2799,7 @@ enable_bbr() {
     fi
     [[ "$cc" =~ ^[a-zA-Z0-9_-]+$ && "$qdisc" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
     mkdir -p /var/lib/sing-box-manager /etc/sysctl.d || return 1
+    chmod 755 /etc/sysctl.d 2>/dev/null || :
     stage=$(mktemp -d /var/lib/sing-box-manager/.bbr.XXXXXX) || return 1
     if ! printf '%s\n' "$cc" "$qdisc" > "$stage/original" ||
        ! printf '%s\n' 'net.core.default_qdisc=fq' 'net.ipv4.tcp_congestion_control=bbr' > "$stage/managed.conf"; then
@@ -2716,8 +2810,7 @@ enable_bbr() {
         rm -rf -- "$stage"
         return 1
     fi
-    # Exclusive creation: never clobber an existing file.
-    if ! (set -C; cat "$BBR_STATE_DIR/managed.conf" > "$BBR_SYSCTL_FILE"); then
+    if ! (set -C; cat "$BBR_STATE_DIR/managed.conf" > "$BBR_SYSCTL_FILE") || ! chmod 644 "$BBR_SYSCTL_FILE"; then
         printf '[错误] BBR 配置创建失败；保留恢复记录，请检查。\n' >&2
         return 1
     fi
@@ -2743,7 +2836,7 @@ config_outbound() {
     while true; do
         ui_clear
         local current_strategy
-        current_strategy=$(jq -r '.outbounds[] | select(.tag=="direct") | ((if (.domain_resolver | type) == "object" then .domain_resolver.strategy else null end) // .domain_strategy // "auto")' $CONFIG_FILE 2>/dev/null)
+        current_strategy=$(jq -r '.outbounds[] | select(.tag=="direct") | ((if (.domain_resolver | type) == "object" then .domain_resolver.strategy else null end) // .domain_strategy // "auto")' "$CONFIG_FILE" 2>/dev/null)
         echo -e "选择: 配置出站 IPv4/IPv6 策略"
         echo -e "当前出站策略: ${GREEN}${current_strategy}${PLAIN}\n"
         echo -e " 1) 仅 IPv4 出站 (ipv4_only)"
@@ -2780,7 +2873,7 @@ config_outbound() {
         fi
 
         if [ "$jq_success" -eq 0 ]; then
-            commit_config || return 1
+            restore_config_and_service || return 1
             pause
             continue
         fi
@@ -2814,8 +2907,6 @@ other_manage() {
     done
 }
 
-
-# Phase one of uninstall: stop/disable, but never remove files on failure.
 stop_managed_service() {
     local svc="$1" state
     [[ "$svc" == sing-box || "$svc" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || return 1
@@ -2840,13 +2931,11 @@ stop_managed_service() {
         esac
         systemctl stop "$svc" || return 1
         if systemctl is-active --quiet "$svc"; then return 1; fi
-        systemctl disable "$svc" || return 1
+        systemctl disable "$svc" >/dev/null 2>&1 || return 1
     fi
     return 0
 }
 
-
-# Ownership records contain data only; never source them as shell code.
 record_cloudflared_owner() {
     local bin="$1" sum tmp
     [ "$bin" = /usr/local/bin/cloudflared ] && [ -f "$bin" ] && [ ! -L "$bin" ] || return 1
@@ -2885,14 +2974,15 @@ cloudflared_owner_valid() {
     return 0
 }
 cloudflared_unshared() {
-    local processes dir rc
-    processes=$(ps -A -o comm=) || return 1
-    if printf '%s\n' "$processes" | grep -q cloudflared; then return 1; fi
+    local dir
+    if grep -q '^cloudflared$' /proc/[0-9]*/comm 2>/dev/null; then
+        return 1
+    fi
     for dir in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system /etc/init.d /etc/cron.d; do
         [ -d "$dir" ] || continue
-        grep -rIl -- cloudflared "$dir" >/dev/null 2>&1
-        rc=$?
-        [ "$rc" = 1 ] || return 1
+        if find "$dir" -type f -exec grep -Il -- cloudflared {} + 2>/dev/null | grep -q .; then
+            return 1
+        fi
     done
     for dir in /etc/cloudflared /usr/local/etc/cloudflared "$HOME/.cloudflared"; do
         [ ! -e "$dir" ] || return 1
@@ -2941,6 +3031,25 @@ ui_clear() {
     fi
 }
 
+resolve_installer_path() {
+    local src="$1" abs=""
+    [ -n "$src" ] && [[ "$src" != /dev/* ]] && [ -f "$src" ] || return 1
+    if command -v readlink >/dev/null 2>&1; then
+        abs=$(readlink -f "$src" 2>/dev/null) || abs=""
+    fi
+    if [ -z "$abs" ] && command -v realpath >/dev/null 2>&1; then
+        abs=$(realpath "$src" 2>/dev/null) || abs=""
+    fi
+    if [ -z "$abs" ]; then
+        case "$src" in
+            /*) abs="$src" ;;
+            *)  abs="$PWD/${src#./}" ;;
+        esac
+    fi
+    [ "$abs" != "/usr/local/bin/sb" ] || return 1
+    printf '%s\n' "$abs"
+}
+
 uninstall_all() {
     local un
     ask "确认卸载脚本、sing-box和所有节点配置吗？(y/n): " un
@@ -2952,6 +3061,7 @@ uninstall_all() {
         local -a services=(sing-box) registered=()
         IFS=',' read -r -a registered <<< "${ARGO_SERVICES:-}"
         for svc in "${registered[@]}"; do
+            [ -n "$svc" ] || continue
             [[ "$svc" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || {
                 echo '服务登记记录无效，取消卸载。' >&2
                 return 1
@@ -2986,8 +3096,6 @@ uninstall_all() {
             fi
         fi
         
-        # cloudflared may be shared with tunnels not managed by this script.
-        # Legacy installations have no trustworthy component ownership record.
         if [ -f "$CONFIG_DIR/.sysctl_backup" ]; then
             local retained_backup
             retained_backup=$(mktemp /root/sing-box-sysctl-backup.XXXXXX) || return 1
@@ -3001,13 +3109,13 @@ uninstall_all() {
         offer_bbr_restore || return 1
         rm -rf /usr/local/bin/sing-box /usr/local/bin/sb /etc/sing-box || return 1
 
-        
-        # Do not guess original kernel values or remove an unowned sysctl file.
-
         local _src=""
         [ -n "${_UNINST_SRC:-}" ] && _src="$_UNINST_SRC"
-        [ -z "$_src" ] && [[ "${0}" != "/usr/local/bin/sb" && "${0}" != "sb" && "${0}" != *"/sb" ]] && _src="${0}"
-        if [ -n "$_src" ] && [ -f "$_src" ] && [ "$_src" != "/usr/local/bin/sb" ]; then
+        if [ -z "$_src" ] && [[ "${0}" != "/usr/local/bin/sb" && "${0}" != "sb" && "${0}" != *"/sb" ]]; then
+            _src=$(resolve_installer_path "${0}") || _src=""
+        fi
+        if [ -n "$_src" ] && [[ "$_src" == /* ]] && [ -f "$_src" ] && [ "$_src" != "/usr/local/bin/sb" ] &&
+           grep -q '^install_kernel() {' "$_src" 2>/dev/null; then
             rm -f "$_src"
             [ -f "$_src" ] && echo -e "${YELLOW}[提示] 提示: 安装器文件 ${_src} 删除失败，请手动移除。${PLAIN}" || echo -e "${GREEN}[完成] 已删除初始安装器: ${_src}${PLAIN}"
         fi
@@ -3082,7 +3190,6 @@ menu() {
     done
 }
 
-
 commit_config() {
     if [ "${CONFIG_TX_BLOCKED:-0}" = 1 ]; then
         echo '事务被阻塞，拒绝删除备份。' >&2
@@ -3095,8 +3202,6 @@ commit_config() {
     fi
     CONFIG_TX_ARGO_PENDING=""
 }
-
-
 
 rename_argo_registration() {
     local old="$1" new="$2" svc updated="" seen=0
@@ -3118,7 +3223,6 @@ rename_argo_registration() {
         fi
         updated="${updated:+${updated},}${svc}"
     done
-    # Repair legacy records where the existing service was not registered.
     [ "$seen" = 1 ] || updated="${updated:+${updated},}${new}"
     save_secret ARGO_SERVICES "$updated" || return 1
     ARGO_SERVICES="$updated"
@@ -3188,7 +3292,6 @@ rename_argo_service() {
     return 1
 }
 
-# Internal helpers; no new menu or feature.
 remove_fw_record() {
     local p="$1" proto="$2" tmp
     [ -f "$FW_PORTS_FILE" ] || return 0
@@ -3214,7 +3317,7 @@ snapshot_service_state() {
     if [ "$OS_TYPE" = alpine ]; then
         [ -e /etc/runlevels/default/sing-box ] && enabled=1
     else
-        systemctl is-enabled --quiet sing-box && enabled=1
+        systemctl is-enabled --quiet sing-box 2>/dev/null && enabled=1
     fi
     printf '%s\n' "$active" > "$d/service.active" &&
     printf '%s\n' "$enabled" > "$d/service.enabled"
@@ -3237,14 +3340,14 @@ restore_service_state() {
     fi
     if [ "$OS_TYPE" = alpine ]; then
         if [ "$enabled" = 1 ]; then
-            rc-update add sing-box default || failed=1
+            [ -e /etc/init.d/sing-box ] && { rc-update add sing-box default || failed=1; }
         elif [ -e /etc/runlevels/default/sing-box ]; then
             rc-update del sing-box default || failed=1
         fi
     elif [ "$enabled" = 1 ]; then
-        systemctl enable sing-box || failed=1
-    elif systemctl is-enabled --quiet sing-box; then
-        systemctl disable sing-box || failed=1
+        [ -e /etc/systemd/system/sing-box.service ] && { systemctl enable sing-box >/dev/null 2>&1 || failed=1; }
+    elif systemctl is-enabled --quiet sing-box 2>/dev/null; then
+        systemctl disable sing-box >/dev/null 2>&1 || failed=1
     fi
     return "$failed"
 }
@@ -3278,8 +3381,8 @@ cleanup_created_argo_service_impl() {
         if systemctl is-active --quiet "$svc"; then
             systemctl stop "$svc" || return 1
         fi
-        if systemctl is-enabled --quiet "$svc"; then
-            systemctl disable "$svc" || return 1
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            systemctl disable "$svc" >/dev/null 2>&1 || return 1
         fi
         rm -f -- "/etc/systemd/system/$svc.service" || return 1
         systemctl daemon-reload
@@ -3313,7 +3416,6 @@ restore_config_and_service() {
         printf '%s\n' '缺少完整事务备份，拒绝不完整恢复。' >&2
         return 1
     fi
-    # Check recovery metadata before changing live files or removing a tunnel.
     if ! IFS= read -r active < "$d/service.active" ||
        ! IFS= read -r enabled < "$d/service.enabled"; then
         echo '服务状态备份缺失，拒绝修改当前配置。' >&2
@@ -3355,10 +3457,10 @@ restore_config_and_service() {
     commit_config
 }
 
-# Bootstrap before the first script download.
 ensure_deps curl wget jq || exit 1
 
 if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" ]]; then
+    INSTALLER_ABS=$(resolve_installer_path "${BASH_SOURCE[0]:-$0}") || INSTALLER_ABS=""
     if [ -f "/usr/local/bin/sb" ]; then
         ui_clear
         echo -e "${GREEN}[完成] 检测到 sing-box 管理脚本已经安装！${PLAIN}\n"
@@ -3367,7 +3469,7 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
         echo -e " 3. 进入面板"
         echo -e " 4. 退出\n"
         mkdir -p "$CONFIG_DIR" 2>/dev/null
-        save_secret "INSTALLER_SRC" "$0"
+        [ -n "$INSTALLER_ABS" ] && save_secret "INSTALLER_SRC" "$INSTALLER_ABS"
         pre_choice=""
         ask "请选择 [1-4]: " pre_choice
         case "$pre_choice" in
@@ -3428,8 +3530,8 @@ if [[ "$0" != "/usr/local/bin/sb" ]] && [[ "$0" != "sb" ]] && [[ "$0" != *"/sb" 
     else
         echo -e "${CYAN}[信息] ==> 正在将管理脚本写入到全局环境...${PLAIN}"
         mkdir -p "$CONFIG_DIR" 2>/dev/null
-        save_secret "INSTALLER_SRC" "$0"
-        if fetch_script; then
+        [ -n "$INSTALLER_ABS" ] && save_secret "INSTALLER_SRC" "$INSTALLER_ABS"
+        if fetch_script "$INSTALLER_ABS"; then
             echo -e "\n${GREEN}==> 脚本安装完成！以后可随时输入 ${YELLOW}sb${GREEN} 快捷调用本面板。${PLAIN}"
             sleep 2
         else
