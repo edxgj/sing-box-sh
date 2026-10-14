@@ -2664,13 +2664,15 @@ bbr_rollback_runtime() {
 }
 
 bbr_check_conflicts() {
-    local f dir rc failed=0
+    local f dir rc
     local pattern='^[[:space:]]*-?[[:space:]]*net[./](core[./]default_qdisc|ipv4[./]tcp_congestion_control)[[:space:]]*='
     local -a files=(/etc/sysctl.conf)
-    for dir in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+    local -a found=()
+    for dir in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d; do
         for f in "$dir"/*.conf; do
             [ -e "$f" ] || [ -L "$f" ] || continue
             [ "$f" = "$BBR_SYSCTL_FILE" ] && continue
+            [ "$f" = "/etc/sysctl.d/99-sysctl.conf" ] && continue
             files+=("$f")
         done
     done
@@ -2679,14 +2681,30 @@ bbr_check_conflicts() {
         grep -nE "$pattern" "$f" >/dev/null 2>&1
         rc=$?
         if [ "$rc" = 0 ]; then
-            printf '[提示] 检测到外部网络配置：%s，请先确认冲突。\n' "$f" >&2
-            failed=1
+            printf '[提示] 检测到外部网络配置：%s\n' "$f" >&2
+            found+=("$f")
         elif [ "$rc" != 1 ]; then
             printf '[错误] 无法检查网络配置：%s\n' "$f" >&2
-            failed=1
+            return 1
         fi
     done
-    return "$failed"
+    if [ "${#found[@]}" -gt 0 ]; then
+        local auto_fix=""
+        ask "是否自动注释上述文件中的冲突配置并继续开启 BBR+FQ？(y/n) [默认: y]: " auto_fix
+        case "${auto_fix:-y}" in
+            y|Y)
+                for f in "${found[@]}"; do
+                    cp -p "$f" "${f}.sb_bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || return 1
+                    sed -i -E 's/^([[:space:]]*-?[[:space:]]*net[./](core[./]default_qdisc|ipv4[./]tcp_congestion_control)[[:space:]]*=)/#\1/' "$f" || return 1
+                done
+                return 0
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    fi
+    return 0
 }
 
 restore_managed_bbr() {
@@ -2788,12 +2806,6 @@ enable_bbr() {
     fi
     if [ -e "$BBR_SYSCTL_FILE" ] || [ -L "$BBR_SYSCTL_FILE" ]; then
         printf '[提示] 存在非本脚本登记的 BBR 配置，未覆盖。\n'
-        pause
-        return 1
-    fi
-    if [ -f /etc/sysctl.conf ] &&
-       grep -qE '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' /etc/sysctl.conf; then
-        printf '[提示] /etc/sysctl.conf 已定义相关参数，请先处理冲突；未修改原文件。\n'
         pause
         return 1
     fi
