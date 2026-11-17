@@ -200,13 +200,16 @@ get_latest_version() {
     echo "$GLOBAL_LATEST_VER"
 }
 
-JQ_DNS_LOCAL='.dns.servers |= (. // []) |
-  if (.dns.servers | map(select(.tag == "dns-local")) | length == 0) then
-    .dns.servers += [{"tag": "dns-local", "type": "local"}]
-  else . end'
+JQ_DNS_LOCAL='.dns.servers |= (
+  ((. // []) | map(if (.tag == "dns-local" or .address == "local") then {"tag": "dns-local", "type": "local"} else . end))
+  | if (map(select(.tag == "dns-local")) | length) == 0 then
+      . + [{"tag": "dns-local", "type": "local"}]
+    else . end
+)'
 
-sb_bin_ge_112() {
+sb_bin_ge_ver() {
     local bin="${1:-/usr/local/bin/sing-box}"
+    local target_minor="${2:-12}"
     local ver
     ver=$( ( "$bin" version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     [ -z "$ver" ] && return 1
@@ -215,12 +218,20 @@ sb_bin_ge_112() {
     minor=$(echo "$ver" | cut -d. -f2)
     [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]] || return 1
     [ "$major" -gt 1 ] && return 0
-    { [ "$major" -eq 1 ] && [ "$minor" -ge 12 ]; } && return 0
+    { [ "$major" -eq 1 ] && [ "$minor" -ge "$target_minor" ]; } && return 0
     return 1
 }
 
+sb_bin_ge_112() {
+    sb_bin_ge_ver "${1:-/usr/local/bin/sing-box}" 12
+}
+
 sb_ge_112() {
-    sb_bin_ge_112 "/usr/local/bin/sing-box"
+    sb_bin_ge_ver "/usr/local/bin/sing-box" 12
+}
+
+sb_ge_114() {
+    sb_bin_ge_ver "/usr/local/bin/sing-box" 14
 }
 
 upgrade_config_schema() {
@@ -232,16 +243,19 @@ upgrade_config_schema() {
     SB_OWNED_TEMP_FILES+=("$tmp")
     cp -p "$target_file" "$tmp" || { rm -f "$tmp"; return 1; }
 
-    local filter='(.route.rules[]? | select(has("geoip") and .geoip == "private")) |= (del(.geoip) | .ip_is_private = true) |
+    local filter='(.route.rules[]? | select(has("geoip") and (.geoip == "private" or .geoip == ["private"]))) |= (del(.geoip) | .ip_is_private = true) |
       if ((.outbounds? // []) | map(select(.tag=="direct")) | length) == 0 then
         .outbounds = ((.outbounds // []) + [{"type":"direct","tag":"direct"}])
       else . end'
 
     if [ "$is_112" -eq 1 ]; then
         filter="$filter |
+          (.inbounds[]?) |= del(.sniff, .sniff_override_destination, .sniff_timeout, .domain_strategy, .udp_disable_domain_unmapping) |
+          (.inbounds[]?.tls?.ech? | select(type == \"object\")) |= del(.pq_signature_schemes_enabled, .dynamic_record_sizing_disabled) |
           (.route.rules[]? | select(.outbound==\"block\")) |= (del(.outbound) | .action=\"reject\") |
-          .outbounds |= map(select(.type!=\"block\")) |
-          if (([.outbounds[]? | select(has(\"domain_strategy\") or has(\"domain_resolver\"))] | length) > 0) then
+          (.route.rules[]? | select(.outbound==\"dns-out\" or .outbound==\"dns\")) |= (del(.outbound) | .action=\"hijack-dns\") |
+          .outbounds |= map(select(.type!=\"block\" and .type!=\"dns\")) |
+          if (([.outbounds[]? | select(has(\"domain_strategy\") or has(\"domain_resolver\"))] | length) > 0) or ((.dns.servers? // []) | length > 0) then
             $JQ_DNS_LOCAL |
             (.outbounds[] | select(has(\"domain_strategy\"))) |= (.domain_resolver = {\"server\": \"dns-local\", \"strategy\": .domain_strategy} | del(.domain_strategy)) |
             (.outbounds[] | select(has(\"domain_resolver\"))) |= (if (.domain_resolver | type) == \"object\" then (if .domain_resolver.server == null or .domain_resolver.server == \"\" then .domain_resolver.server = \"dns-local\" else . end) else . end)
@@ -274,7 +288,7 @@ check_port_in_config() {
         [ -z "$e_type" ] && continue
         case "$e_type" in
             hysteria2|tuic) e_proto="udp" ;;
-            anytls|vless)   e_proto="tcp" ;;
+            anytls|vless|snell) e_proto="tcp" ;;
             shadowsocks)    e_proto="both" ;;
             *)              e_proto="both" ;;
         esac
@@ -374,8 +388,8 @@ load_secrets() {
     for key in $(compgen -A variable); do
         case "$key" in
             REAL_DOMAIN|SELF_DOMAIN|REAL_CERT_OWNED|INSTALLER_SRC|CERT_TYPE|DOMAIN|ARGO_SERVICES) unset "$key" || return 1 ;;
-            REALITY_PUB_*|ARGO_IP_*|ARGO_DOMAIN_*)
-                [[ "$key" =~ ^(REALITY_PUB|ARGO_IP|ARGO_DOMAIN)_[0-9]+$ ]] && { unset "$key" || return 1; } ;;
+            REALITY_PUB_*|ARGO_IP_*|ARGO_DOMAIN_*|HY2_HOP_*)
+                [[ "$key" =~ ^(REALITY_PUB|ARGO_IP|ARGO_DOMAIN|HY2_HOP)_[0-9]+$ ]] && { unset "$key" || return 1; } ;;
         esac
     done
     [ -f "$SECRETS_FILE" ] || return 0
@@ -386,7 +400,7 @@ load_secrets() {
         val="${BASH_REMATCH[2]}"
         case "$key" in
             REAL_DOMAIN|SELF_DOMAIN|REAL_CERT_OWNED|INSTALLER_SRC|CERT_TYPE|DOMAIN|ARGO_SERVICES) ;;
-            *) [[ "$key" =~ ^(REALITY_PUB|ARGO_IP|ARGO_DOMAIN)_[0-9]+$ ]] || continue ;;
+            *) [[ "$key" =~ ^(REALITY_PUB|ARGO_IP|ARGO_DOMAIN|HY2_HOP)_[0-9]+$ ]] || continue ;;
         esac
         printf -v "$key" '%s' "$val" || return 1
     done < "$SECRETS_FILE"
@@ -498,6 +512,21 @@ cleanup_node_secrets() {
         remove_secret "ARGO_DOMAIN_${port}" || return 1
     elif [ "$type" == "vless" ]; then
         remove_secret "REALITY_PUB_${port}" || return 1
+    elif [ "$type" == "hysteria2" ]; then
+        remove_secret "HY2_HOP_${port}" || return 1
+    fi
+    return 0
+}
+
+save_iptables_rules() {
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || return 1
+    elif command -v iptables-save >/dev/null 2>&1; then
+        mkdir -p /etc/iptables && chmod 755 /etc/iptables 2>/dev/null
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || return 1
+        if command -v ip6tables-save >/dev/null 2>&1; then
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || return 1
+        fi
     fi
     return 0
 }
@@ -510,53 +539,49 @@ open_fw_port() {
         open_fw_port "$port" "udp" || return 1
         return 0
     fi
+    local colon_port="${port//-/:}"
+    local dash_port="${port//:/-}"
     local success=0
     local fw_found=0
 
     if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -qw "active"; then
         fw_found=1
-        if ufw allow "${port}"/"${proto}" comment 'sb-sh' >/dev/null 2>&1 || ufw allow "${port}"/"${proto}" >/dev/null 2>&1; then
+        if ufw allow "${colon_port}"/"${proto}" comment 'sb-sh' >/dev/null 2>&1 || ufw allow "${colon_port}"/"${proto}" >/dev/null 2>&1; then
             success=1
         fi
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         fw_found=1
-        if firewall-cmd --add-port="${port}"/"${proto}" --permanent >/dev/null 2>&1 &&
+        if firewall-cmd --add-port="${dash_port}"/"${proto}" --permanent >/dev/null 2>&1 &&
            firewall-cmd --reload >/dev/null 2>&1; then success=1; fi
     elif command -v iptables >/dev/null 2>&1; then
         fw_found=1
         success=1
-        if ! iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; then
-            iptables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || success=0
+        if ! iptables -C INPUT -p "${proto}" --dport "${colon_port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; then
+            iptables -I INPUT -p "${proto}" --dport "${colon_port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || success=0
         fi
         if command -v ip6tables >/dev/null 2>&1; then
-            if ! ip6tables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; then
-                ip6tables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || success=0
+            if ! ip6tables -C INPUT -p "${proto}" --dport "${colon_port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; then
+                ip6tables -I INPUT -p "${proto}" --dport "${colon_port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || success=0
             fi
         fi
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1
-        elif command -v iptables-save >/dev/null 2>&1; then
-            mkdir -p /etc/iptables && chmod 755 /etc/iptables 2>/dev/null
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-            command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-        fi
+        save_iptables_rules >/dev/null 2>&1 || :
     fi
 
     if [ "$fw_found" -eq 1 ] && [ "$success" -eq 1 ]; then
         local tmp_fw
         tmp_fw=$(mktemp "${FW_PORTS_FILE}.tmp.XXXXXX") || return 1
         SB_OWNED_TEMP_FILES+=("$tmp_fw")
-        if ! ( if [ -f "$FW_PORTS_FILE" ]; then cat "$FW_PORTS_FILE" || exit 1; fi; printf '%s/%s\n' "$port" "$proto" ) > "$tmp_fw"; then
+        if ! ( if [ -f "$FW_PORTS_FILE" ]; then cat "$FW_PORTS_FILE" || exit 1; fi; printf '%s/%s\n' "$dash_port" "$proto" ) > "$tmp_fw"; then
             rm -f "$tmp_fw"; return 1
         fi
         if ! sort -u -o "$tmp_fw" "$tmp_fw" || ! chmod 600 "$tmp_fw" || ! mv -f "$tmp_fw" "$FW_PORTS_FILE"; then
             rm -f "$tmp_fw"; return 1
         fi
-        echo -e "${GREEN}[完成] 放行端口 ${port}/${proto} 成功${PLAIN}" >&2
+        echo -e "${GREEN}[完成] 放行端口 ${dash_port}/${proto} 成功${PLAIN}" >&2
     elif [ "$fw_found" -eq 0 ]; then
-        echo -e "${YELLOW}[提示] 未检测到系统内置防火墙工具，请确保云服务商后台和本机系统放行了 ${port} 端口！${PLAIN}" >&2
+        echo -e "${YELLOW}[提示] 未检测到系统内置防火墙工具，请确保云服务商后台和本机系统放行了 ${dash_port} 端口！${PLAIN}" >&2
     else
-        printf '放行端口 %s/%s 失败。\n' "$port" "$proto" >&2
+        printf '放行端口 %s/%s 失败。\n' "$dash_port" "$proto" >&2
         return 1
     fi
     return 0
@@ -571,32 +596,26 @@ close_fw_port() {
         close_fw_port "$port" "udp" || failed=1
         return "$failed"
     fi
+    local colon_port="${port//-/:}"
+    local dash_port="${port//:/-}"
 
     if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -qw "active"; then
-        ufw delete allow "${port}"/"${proto}" >/dev/null 2>&1 || return 1
+        ufw delete allow "${colon_port}"/"${proto}" >/dev/null 2>&1 || return 1
     elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        if firewall-cmd --query-port="${port}"/"${proto}" --permanent >/dev/null 2>&1; then
-            firewall-cmd --remove-port="${port}"/"${proto}" --permanent >/dev/null 2>&1 &&
+        if firewall-cmd --query-port="${dash_port}"/"${proto}" --permanent >/dev/null 2>&1; then
+            firewall-cmd --remove-port="${dash_port}"/"${proto}" --permanent >/dev/null 2>&1 &&
             firewall-cmd --reload >/dev/null 2>&1 || return 1
         fi
     elif command -v iptables >/dev/null 2>&1; then
-        while iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; do
-            iptables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || return 1
+        while iptables -C INPUT -p "${proto}" --dport "${colon_port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; do
+            iptables -D INPUT -p "${proto}" --dport "${colon_port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || return 1
         done
         if command -v ip6tables >/dev/null 2>&1; then
-            while ip6tables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; do
-                ip6tables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || return 1
+            while ip6tables -C INPUT -p "${proto}" --dport "${colon_port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1; do
+                ip6tables -D INPUT -p "${proto}" --dport "${colon_port}" -m comment --comment "sb-sh" -j ACCEPT >/dev/null 2>&1 || return 1
             done
         fi
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1 || return 1
-        elif command -v iptables-save >/dev/null 2>&1; then
-            mkdir -p /etc/iptables && chmod 755 /etc/iptables 2>/dev/null
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || return 1
-            if command -v ip6tables-save >/dev/null 2>&1; then
-                ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || return 1
-            fi
-        fi
+        save_iptables_rules || return 1
     else
         echo '无法确认防火墙规则已删除，保留追踪记录。' >&2
         return 1
@@ -604,8 +623,87 @@ close_fw_port() {
     return 0
 }
 
+apply_hy2_hop_nat() {
+    local target_port="$1" range="$2"
+    local colon_range="${range//-/:}"
+    local dash_range="${range//:/-}"
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo -e "${RED}[错误] 未检测到 iptables，无法配置端口跳跃 NAT 转发规则！${PLAIN}" >&2
+        return 1
+    fi
+    if ! iptables -t nat -C PREROUTING -p udp --dport "$colon_range" -m comment --comment "sb-hy2-hop-${target_port}" -j REDIRECT --to-ports "$target_port" >/dev/null 2>&1; then
+        if ! iptables -t nat -I PREROUTING -p udp --dport "$colon_range" -m comment --comment "sb-hy2-hop-${target_port}" -j REDIRECT --to-ports "$target_port" >/dev/null 2>&1; then
+            echo -e "${RED}[错误] 添加 IPv4 端口跳跃 NAT 规则失败！${PLAIN}" >&2
+            return 1
+        fi
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ! ip6tables -t nat -C PREROUTING -p udp --dport "$colon_range" -m comment --comment "sb-hy2-hop-${target_port}" -j REDIRECT --to-ports "$target_port" >/dev/null 2>&1; then
+            ip6tables -t nat -I PREROUTING -p udp --dport "$colon_range" -m comment --comment "sb-hy2-hop-${target_port}" -j REDIRECT --to-ports "$target_port" >/dev/null 2>&1 || :
+        fi
+    fi
+    open_fw_port "$dash_range" "udp" || :
+    save_iptables_rules >/dev/null 2>&1 || :
+    return 0
+}
+
+remove_hy2_hop_nat() {
+    local target_port="$1" range="$2"
+    [ -n "$range" ] || return 0
+    local colon_range="${range//-/:}"
+    local dash_range="${range//:/-}"
+    if command -v iptables >/dev/null 2>&1; then
+        while iptables -t nat -C PREROUTING -p udp --dport "$colon_range" -m comment --comment "sb-hy2-hop-${target_port}" -j REDIRECT --to-ports "$target_port" >/dev/null 2>&1; do
+            iptables -t nat -D PREROUTING -p udp --dport "$colon_range" -m comment --comment "sb-hy2-hop-${target_port}" -j REDIRECT --to-ports "$target_port" >/dev/null 2>&1 || break
+        done
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        while ip6tables -t nat -C PREROUTING -p udp --dport "$colon_range" -m comment --comment "sb-hy2-hop-${target_port}" -j REDIRECT --to-ports "$target_port" >/dev/null 2>&1; do
+            ip6tables -t nat -D PREROUTING -p udp --dport "$colon_range" -m comment --comment "sb-hy2-hop-${target_port}" -j REDIRECT --to-ports "$target_port" >/dev/null 2>&1 || break
+        done
+    fi
+    if close_fw_port "$dash_range" "udp" >/dev/null 2>&1; then
+        remove_fw_record "$dash_range" "udp" >/dev/null 2>&1 || :
+    fi
+    save_iptables_rules >/dev/null 2>&1 || :
+    return 0
+}
+
+prompt_hy2_hop_range() {
+    local main_port="$1" val s_port e_port
+    while true; do
+        ask "请输入端口跳跃范围 (例如 20000-30000，直接回车取消): " val
+        if [ -z "$val" ]; then
+            printf '%s\n' ""
+            return 0
+        fi
+        val="${val//:/-}"
+        if [[ "$val" =~ ^([1-9][0-9]{0,4})-([1-9][0-9]{0,4})$ ]]; then
+            s_port="${BASH_REMATCH[1]}"
+            e_port="${BASH_REMATCH[2]}"
+            if [ "$s_port" -ge 1 ] && [ "$e_port" -le 65535 ] && [ "$s_port" -lt "$e_port" ]; then
+                if [ "$main_port" -ge "$s_port" ] && [ "$main_port" -le "$e_port" ]; then
+                    echo -e "${RED}[错误] 跳跃范围不能包含节点主监听端口 (${main_port})！${PLAIN}" >&2
+                    continue
+                fi
+                printf '%s\n' "${s_port}-${e_port}"
+                return 0
+            fi
+        fi
+        echo -e "${RED}[错误] 格式错误！请输入有效的起始-结束端口范围 (1-65535，且起始小于结束)。${PLAIN}" >&2
+    done
+}
+
 remove_all_fw_rules() {
     local port proto failed=0
+    load_secrets 2>/dev/null || :
+    local key p_num
+    for key in $(compgen -A variable); do
+        if [[ "$key" =~ ^HY2_HOP_([0-9]+)$ ]]; then
+            p_num="${BASH_REMATCH[1]}"
+            remove_hy2_hop_nat "$p_num" "${!key}" || :
+        fi
+    done
     [ -f "$FW_PORTS_FILE" ] || return 0
     while IFS="/" read -r port proto; do
         [ -n "$port" ] && [ -n "$proto" ] || continue
@@ -881,7 +979,7 @@ init_base() {
 
         if [ -z "$VERSION" ]; then
             echo -e "${YELLOW}[提示] 获取版本信息失败！${PLAIN}"
-            ask "请手动输入要安装的 sing-box 版本号 (例如 1.10.1): " VERSION
+            ask "请手动输入要安装的 sing-box 版本号 (例如 1.14.4): " VERSION
             if [ -z "$VERSION" ]; then
                 echo -e "${RED}[错误] 未输入版本号，安装终止。${PLAIN}"
                 return 1
@@ -1438,6 +1536,41 @@ get_pass() {
     printf '密码: %b%s%b\n' "$GREEN" "$val" "$PLAIN" >&2
     printf '%s\n' "$val"
 }
+
+get_snell_psk() {
+    local val len
+    while true; do
+        ask "请输入 Snell v6 PSK 密钥 (12-255字节) [默认随机]: " val
+        val=${val:-$(/usr/local/bin/sing-box generate rand --base64 16)}
+        len=$(LC_ALL=C printf '%s' "$val" | wc -c)
+        if [[ "$val" =~ [^[:space:]] ]] && [ "$len" -ge 12 ] && [ "$len" -le 255 ]; then
+            break
+        else
+            echo -e "${RED}[错误] Snell v6 要求 PSK 长度必须在 12 到 255 字节之间（当前: ${len} 字节）！${PLAIN}" >&2
+        fi
+    done
+    printf 'PSK: %b%s%b\n' "$GREEN" "$val" "$PLAIN" >&2
+    printf '%s\n' "$val"
+}
+
+get_snell_mode() {
+    local MODES=("default" "unshaped" "unsafe-raw")
+    echo -e "选择 Snell v6 流量整形模式 (mode):" >&2
+    echo -e " 1) default (默认流量整形)" >&2
+    echo -e " 2) unshaped (不整形)" >&2
+    echo -e " 3) unsafe-raw (原始无整形)" >&2
+    local idx
+    while true; do
+        ask "请选择 [1-3] [默认: 1]: " idx
+        idx=${idx:-1}
+        if [[ "$idx" =~ ^[1-3]$ ]]; then
+            echo "${MODES[$((idx - 1))]}"
+            return
+        fi
+        echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}" >&2
+    done
+}
+
 get_ss_method() {
     local METHODS=("aes-128-gcm" "aes-256-gcm" "chacha20-ietf-poly1305" "2022-blake3-aes-128-gcm" "2022-blake3-aes-256-gcm" "2022-blake3-chacha20-poly1305")
     echo -e "选择加密方式:" >&2
@@ -1497,12 +1630,13 @@ node_read() {
       (.listen_port|tostring),
       (.tls.certificate_path // ""),
       (.users[0].uuid // ""),
-      (if .type == "shadowsocks" then .password else .users[0].password end // ""),
+      (if .type == "shadowsocks" then .password elif .type == "snell" then .psk else .users[0].password end // ""),
       (.tls.server_name // ""),
       (.tls.reality.short_id[0] // ""),
       (if .tls.reality.enabled == true then "1" else "0" end),
       (if .transport.type == "ws" then "1" else "0" end),
-      (.method // "")
+      (if .type == "snell" then (if (.mode // "") == "" then "default" else .mode end) else (.method // "") end),
+      (if .type == "snell" then ((.version // 6)|tostring) else "" end)
     ' "$CONFIG_FILE" 2>/dev/null
 }
 
@@ -1535,7 +1669,7 @@ build_share_url() {
     [ "${#M[@]}" -lt 9 ] && { echo -e "${RED}[错误] [读取节点 $TAG 失败]${PLAIN}"; return; }
     local TYPE=${M[0]} PORT=${M[1]} CERT_PATH=${M[2]}
     local N_UUID=${M[3]} N_PASS=${M[4]} SNI=${M[5]} SID=${M[6]}
-    local IS_REALITY=${M[7]} IS_WS=${M[8]} SS_METHOD=${M[9]}
+    local IS_REALITY=${M[7]} IS_WS=${M[8]} SS_METHOD=${M[9]} SNELL_VER=${M[10]:-6}
 
     resolve_conn "$CERT_PATH" "$IP"
     local SNI_URL="${CONN_SNI:+&sni=${CONN_SNI}}"
@@ -1567,7 +1701,10 @@ build_share_url() {
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Hysteria2 链接]${PLAIN}"; return; fi
             local AUTH_ENC
             AUTH_ENC=$(url_encode "$N_PASS")
-            printf '%s\n' "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
+            local var_hop="HY2_HOP_${PORT}"
+            local HOP_RANGE="${!var_hop:-}"
+            local MPORT_URL="${HOP_RANGE:+&mport=${HOP_RANGE}}"
+            printf '%s\n' "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}${MPORT_URL}#${TAG}"
             ;;
         tuic)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 TUIC 链接]${PLAIN}"; return; fi
@@ -1593,6 +1730,10 @@ build_share_url() {
             fi
             printf '%s\n' "ss://${SS_CRED}@${CONN_ADDR_URI}:${PORT}#${TAG}"
             ;;
+        snell)
+            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Snell 链接]${PLAIN}"; return; fi
+            printf '%s\n' "${TAG} = snell, ${CONN_ADDR_URI}, ${PORT}, psk=${N_PASS}, version=${SNELL_VER:-6}, reuse=true, tfo=true"
+            ;;
     esac
 }
 
@@ -1607,7 +1748,7 @@ print_config_detail() {
     [ "${#M[@]}" -lt 9 ] && { echo -e "${RED}[错误] [读取节点 $TAG 失败]${PLAIN}"; return; }
     local TYPE=${M[0]} PORT=${M[1]} CERT_PATH=${M[2]}
     local N_UUID=${M[3]} N_PASS=${M[4]} SNI=${M[5]} SID=${M[6]}
-    local IS_REALITY=${M[7]} IS_WS=${M[8]} SS_METHOD=${M[9]}
+    local IS_REALITY=${M[7]} IS_WS=${M[8]} SS_METHOD=${M[9]} SNELL_VER=${M[10]:-6}
 
     resolve_conn "$CERT_PATH" "$IP"
     local INSECURE_TEXT="true"
@@ -1652,8 +1793,11 @@ print_config_detail() {
         hysteria2)
             local CONN_ADDR_DISP
             CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            local var_hop="HY2_HOP_${PORT}"
+            local HOP_RANGE="${!var_hop:-}"
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
+            [ -n "$HOP_RANGE" ] && echo -e "跳跃端口 (mport)\t\t= $HOP_RANGE"
             printf '密码 (password)\t\t\t= %s\n' "$N_PASS"
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "应用层协议协商 (Alpn)\t\t= h3"
@@ -1692,12 +1836,21 @@ print_config_detail() {
             echo -e "加密方式 (method)\t\t= ${SS_METHOD:-未知}"
             echo -e "传输模式 (mode)\t\t= tcp+udp"
             ;;
+        snell)
+            local CONN_ADDR_DISP
+            CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
+            echo -e "端口 (port)\t\t\t= $PORT"
+            printf '密钥 (psk)\t\t\t= %s\n' "$N_PASS"
+            echo -e "版本 (version)\t\t\t= ${SNELL_VER:-6}"
+            echo -e "流量整形 (mode)\t\t\t= ${SS_METHOD:-default}"
+            ;;
     esac
 
     echo -e "------------- 链接 (URL) -------------"
     build_share_url "$TAG" "$IP"
 
-    if [ "$INSECURE_TEXT" == "true" ] && [ "$IS_REALITY" != "1" ] && [ "$IS_WS" != "1" ] && [ "$TYPE" != "shadowsocks" ]; then
+    if [ "$INSECURE_TEXT" == "true" ] && [ "$IS_REALITY" != "1" ] && [ "$IS_WS" != "1" ] && [ "$TYPE" != "shadowsocks" ] && [ "$TYPE" != "snell" ]; then
         echo -e "\n${YELLOW}警告! 此节点使用自签名证书，请确保客户端已开启「跳过证书验证」！${PLAIN}\n"
     fi
 }
@@ -1749,7 +1902,7 @@ warn_port_shared() {
         local o_proto=""
         case "$o_type" in
             hysteria2|tuic) o_proto="udp" ;;
-            anytls|vless)   o_proto="tcp" ;;
+            anytls|vless|snell) o_proto="tcp" ;;
             shadowsocks)    o_proto="both" ;;
         esac
         if [ -n "$o_proto" ] && [ "$o_proto" != "both" ] && [ "$proto" != "both" ] && [ "$o_proto" != "$proto" ]; then
@@ -1772,15 +1925,22 @@ add_config() {
         echo -e " 4) AnyTLS"
         echo -e " 5) VLESS-Argo"
         echo -e " 6) Shadowsocks"
+        echo -e " 7) Snell v6"
         echo -e " 0) 返回\n"
         
         local proto_idx
         while true; do
-            ask "请选择 [0-6]: " proto_idx
-            if [[ "$proto_idx" =~ ^[0-6]$ ]]; then break; fi
+            ask "请选择 [0-7]: " proto_idx
+            if [[ "$proto_idx" =~ ^[0-7]$ ]]; then break; fi
             echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}"
         done
         [ "$proto_idx" == "0" ] && return
+
+        if [ "$proto_idx" == "7" ] && ! sb_ge_114; then
+            echo -e "${RED}[错误] 官方自 sing-box 1.14.0 起才支持 Snell v6 协议！请先在主菜单 [7) 更新] 升级内核。${PLAIN}"
+            pause
+            continue
+        fi
 
         load_secrets
         local DEF_PORT
@@ -1789,7 +1949,7 @@ add_config() {
         
         local f_proto=""
         local check_proto="tcp"
-        if [[ "$proto_idx" == "1" || "$proto_idx" == "4" ]]; then f_proto="tcp"; check_proto="tcp"
+        if [[ "$proto_idx" == "1" || "$proto_idx" == "4" || "$proto_idx" == "7" ]]; then f_proto="tcp"; check_proto="tcp"
         elif [[ "$proto_idx" == "2" || "$proto_idx" == "3" ]]; then f_proto="udp"; check_proto="udp"
         elif [ "$proto_idx" == "5" ]; then f_proto=""; check_proto="tcp"
         elif [ "$proto_idx" == "6" ]; then f_proto="both"; check_proto="both"
@@ -1823,6 +1983,7 @@ add_config() {
             4) DEF_TAG="anytls" ;;
             5) DEF_TAG="vless-argo" ;;
             6) DEF_TAG="shadowsocks" ;;
+            7) DEF_TAG="snell" ;;
         esac
         DEF_TAG="${DEF_TAG}-${HOST_NAME}"
         
@@ -1853,6 +2014,7 @@ add_config() {
         backup_config || return 1
         local IS_ARGO=0
         local jq_ok=1
+        local HY2_HOP_RANGE=""
 
         case "$proto_idx" in
             1)
@@ -1876,6 +2038,11 @@ add_config() {
             2)
                 local PASS
                 PASS=$(get_pass) || exit 1
+                local hop_yn=""
+                ask "是否开启 Hysteria2 端口跳跃 (Port Hopping)？(y/n) [默认: n]: " hop_yn
+                if [[ "${hop_yn:-n}" == "y" || "${hop_yn:-n}" == "Y" ]]; then
+                    HY2_HOP_RANGE=$(prompt_hy2_hop_range "$PORT") || exit 1
+                fi
                 apply_jq_config '.inbounds += [{"type":"hysteria2","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}]' \
                 --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
                 ;;
@@ -1890,7 +2057,7 @@ add_config() {
             4)
                 local PASS
                 PASS=$(get_pass) || exit 1
-                apply_jq_config '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"alpn":["h2","http/1.1"],"certificate_path":$cert,"key_path":$key}}]' \
+                apply_jq_config '.inbounds += [{"type":"anytls","tag":$tag,"listen":"::","listen_port":$p,"users":[{"password":$pass}],"tls":{"enabled":true,"certificate_path":$cert,"key_path":$key}}]' \
                 --argjson p "$PORT" --arg pass "$PASS" --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY" || jq_ok=0
                 ;;
             5)
@@ -2045,12 +2212,24 @@ EOF
                 apply_jq_config '.inbounds += [{"type":"shadowsocks","tag":$tag,"listen":"::","listen_port":$p,"method":$m,"password":$pass}]' \
                 --argjson p "$PORT" --arg m "$SS_METHOD" --arg pass "$PASS" --arg tag "$TAG" || jq_ok=0
                 ;;
+            7)
+                local PASS
+                PASS=$(get_snell_psk) || exit 1
+                local SNELL_MODE
+                SNELL_MODE=$(get_snell_mode) || exit 1
+                apply_jq_config '.inbounds += [{"type":"snell","tag":$tag,"listen":"::","listen_port":$p,"version":6,"psk":$pass,"mode":$m}]' \
+                --argjson p "$PORT" --arg pass "$PASS" --arg m "$SNELL_MODE" --arg tag "$TAG" || jq_ok=0
+                ;;
         esac
 
         if [ "$jq_ok" -eq 0 ]; then
             restore_config_and_service || return 1
             pause
             continue
+        fi
+
+        if [ -n "$HY2_HOP_RANGE" ]; then
+            save_secret "HY2_HOP_${PORT}" "$HY2_HOP_RANGE" || { restore_config_and_service || return 1; return 1; }
         fi
 
         if ! restart_service; then
@@ -2073,6 +2252,14 @@ EOF
             ask "是否自动放行端口？(y/n) [默认: y]: " auto_fw
             if [[ "${auto_fw:-y}" == "y" || "${auto_fw:-y}" == "Y" ]]; then
                 open_fw_port "$PORT" "$f_proto"
+            fi
+        fi
+
+        if [ -n "$HY2_HOP_RANGE" ]; then
+            if apply_hy2_hop_nat "$PORT" "$HY2_HOP_RANGE"; then
+                echo -e "${GREEN}[完成] 已设置 Hysteria2 端口跳跃: ${HY2_HOP_RANGE} -> ${PORT}/udp${PLAIN}"
+            else
+                remove_secret "HY2_HOP_${PORT}" || :
             fi
         fi
         
@@ -2098,9 +2285,11 @@ modify_config() {
                 break
             fi
             
-            echo -e "\n当前选中: ${YELLOW}$TAG${PLAIN}"
+            load_secrets
+            echo -e "\n当前选中: ${YELLOW}$TAG${PLAIN} (${CYAN}${TYPE}${PLAIN})"
             
             local action=""
+            local mod_idx=""
             if [ "$TYPE" == "vless" ]; then
                 local IS_REALITY
                 IS_REALITY=$(jq -r --arg tag "$TAG" '[.inbounds[] | select(.tag==$tag) | .tls.reality.enabled] | .[0] // false' "$CONFIG_FILE" 2>/dev/null)
@@ -2117,7 +2306,6 @@ modify_config() {
                 echo -e " 0) 返回\n"
                 
                 while true; do
-                    local mod_idx
                     if [ "$IS_REALITY" -eq 1 ] || [ "$IS_ARGO" -eq 1 ]; then
                         ask "请选择 [0-4]: " mod_idx
                         case "$mod_idx" in 
@@ -2139,21 +2327,97 @@ modify_config() {
                         esac
                     fi
                 done
-            elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "anytls" || "$TYPE" == "tuic" || "$TYPE" == "shadowsocks" ]]; then
+            elif [ "$TYPE" == "hysteria2" ]; then
+                local var_hop="HY2_HOP_${OLD_PORT}"
+                local CUR_HOP="${!var_hop:-未开启}"
                 echo -e " 1) 更改主密钥/密码"
                 echo -e " 2) 更改端口"
                 echo -e " 3) 更改节点名称"
-                if [ "$TYPE" != "shadowsocks" ]; then echo -e " 4) 更改证书类型 (域名/自签)"; fi
+                echo -e " 4) 更改证书类型 (域名/自签)"
+                echo -e " 5) 配置/管理端口跳跃 [当前: ${GREEN}${CUR_HOP}${PLAIN}]"
                 echo -e " 0) 返回\n"
                 while true; do
-                    if [ "$TYPE" == "shadowsocks" ]; then ask "请选择 [0-3]: " mod_idx; else ask "请选择 [0-4]: " mod_idx; fi
-                    case "$mod_idx" in 
-                        1) action="pass"; break ;; 
-                        2) action="port"; break ;; 
-                        3) action="tag"; break ;; 
-                        4) if [ "$TYPE" != "shadowsocks" ]; then action="cert"; break; else echo -e "${RED}[错误] 错误!${PLAIN}"; fi ;; 
-                        0) break ;; 
-                        *) echo -e "${RED}[错误] 错误!${PLAIN}" ;; 
+                    ask "请选择 [0-5]: " mod_idx
+                    case "$mod_idx" in
+                        1) action="pass"; break ;;
+                        2) action="port"; break ;;
+                        3) action="tag"; break ;;
+                        4) action="cert"; break ;;
+                        5) action="hy2_hop"; break ;;
+                        0) break ;;
+                        *) echo -e "${RED}[错误] 错误!${PLAIN}" ;;
+                    esac
+                done
+            elif [ "$TYPE" == "tuic" ]; then
+                echo -e " 1) 更改主密钥/密码"
+                echo -e " 2) 更改端口"
+                echo -e " 3) 更改节点名称"
+                echo -e " 4) 更改证书类型 (域名/自签)"
+                echo -e " 5) 更改 UUID"
+                echo -e " 0) 返回\n"
+                while true; do
+                    ask "请选择 [0-5]: " mod_idx
+                    case "$mod_idx" in
+                        1) action="pass"; break ;;
+                        2) action="port"; break ;;
+                        3) action="tag"; break ;;
+                        4) action="cert"; break ;;
+                        5) action="uuid"; break ;;
+                        0) break ;;
+                        *) echo -e "${RED}[错误] 错误!${PLAIN}" ;;
+                    esac
+                done
+            elif [ "$TYPE" == "anytls" ]; then
+                echo -e " 1) 更改主密钥/密码"
+                echo -e " 2) 更改端口"
+                echo -e " 3) 更改节点名称"
+                echo -e " 4) 更改证书类型 (域名/自签)"
+                echo -e " 0) 返回\n"
+                while true; do
+                    ask "请选择 [0-4]: " mod_idx
+                    case "$mod_idx" in
+                        1) action="pass"; break ;;
+                        2) action="port"; break ;;
+                        3) action="tag"; break ;;
+                        4) action="cert"; break ;;
+                        0) break ;;
+                        *) echo -e "${RED}[错误] 错误!${PLAIN}" ;;
+                    esac
+                done
+            elif [ "$TYPE" == "shadowsocks" ]; then
+                echo -e " 1) 更改主密钥/密码"
+                echo -e " 2) 更改端口"
+                echo -e " 3) 更改节点名称"
+                echo -e " 4) 更改加密方式 (method)"
+                echo -e " 0) 返回\n"
+                while true; do
+                    ask "请选择 [0-4]: " mod_idx
+                    case "$mod_idx" in
+                        1) action="pass"; break ;;
+                        2) action="port"; break ;;
+                        3) action="tag"; break ;;
+                        4) action="ss_method"; break ;;
+                        0) break ;;
+                        *) echo -e "${RED}[错误] 错误!${PLAIN}" ;;
+                    esac
+                done
+            elif [ "$TYPE" == "snell" ]; then
+                local CUR_SNELL_MODE
+                CUR_SNELL_MODE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | if (.mode // "") == "" then "default" else .mode end' "$CONFIG_FILE" 2>/dev/null)
+                echo -e " 1) 更改 PSK 密钥"
+                echo -e " 2) 更改端口"
+                echo -e " 3) 更改节点名称"
+                echo -e " 4) 更改流量整形模式 (mode) [当前: ${GREEN}${CUR_SNELL_MODE}${PLAIN}]"
+                echo -e " 0) 返回\n"
+                while true; do
+                    ask "请选择 [0-4]: " mod_idx
+                    case "$mod_idx" in
+                        1) action="pass"; break ;;
+                        2) action="port"; break ;;
+                        3) action="tag"; break ;;
+                        4) action="snell_mode"; break ;;
+                        0) break ;;
+                        *) echo -e "${RED}[错误] 错误!${PLAIN}" ;;
                     esac
                 done
             else
@@ -2169,6 +2433,47 @@ modify_config() {
                 NEW_ARGO_IP=$(get_domain "请输入新的 Argo 优选域名/IP" "saas.sin.fan" "true") || exit 1
                 save_secret "ARGO_IP_${OLD_PORT}" "$NEW_ARGO_IP" || return 1
                 echo -e "${GREEN}[完成] 优选域名/IP 已成功更改为: $NEW_ARGO_IP${PLAIN}"
+                pause
+                continue
+            fi
+
+            if [ "$action" == "hy2_hop" ]; then
+                local var_hop="HY2_HOP_${OLD_PORT}"
+                local OLD_HOP="${!var_hop:-}"
+                echo -e "\n当前端口跳跃状态: ${GREEN}${OLD_HOP:-未开启}${PLAIN}"
+                echo -e " 1) 设置/修改端口跳跃范围"
+                echo -e " 2) 关闭并清除端口跳跃"
+                echo -e " 0) 取消\n"
+                local hop_act=""
+                ask "请选择 [0-2]: " hop_act
+                case "$hop_act" in
+                    1)
+                        local NEW_HOP
+                        NEW_HOP=$(prompt_hy2_hop_range "$OLD_PORT") || exit 1
+                        if [ -z "$NEW_HOP" ]; then
+                            echo -e "${YELLOW}[提示] 已取消。${PLAIN}"
+                            pause
+                            continue
+                        fi
+                        [ -n "$OLD_HOP" ] && remove_hy2_hop_nat "$OLD_PORT" "$OLD_HOP"
+                        if apply_hy2_hop_nat "$OLD_PORT" "$NEW_HOP" && save_secret "HY2_HOP_${OLD_PORT}" "$NEW_HOP"; then
+                            echo -e "${GREEN}[完成] 端口跳跃已更新为: ${NEW_HOP} -> ${OLD_PORT}/udp${PLAIN}"
+                        else
+                            [ -n "$OLD_HOP" ] && apply_hy2_hop_nat "$OLD_PORT" "$OLD_HOP" >/dev/null 2>&1
+                            echo -e "${RED}[错误] 端口跳跃设置失败！${PLAIN}"
+                        fi
+                        ;;
+                    2)
+                        if [ -z "$OLD_HOP" ]; then
+                            echo -e "${YELLOW}[提示] 当前未开启端口跳跃。${PLAIN}"
+                        else
+                            remove_hy2_hop_nat "$OLD_PORT" "$OLD_HOP"
+                            remove_secret "HY2_HOP_${OLD_PORT}" || return 1
+                            echo -e "${GREEN}[完成] 已关闭并清除端口跳跃 (${OLD_HOP})。${PLAIN}"
+                        fi
+                        ;;
+                    *) ;;
+                esac
                 pause
                 continue
             fi
@@ -2195,6 +2500,8 @@ modify_config() {
                         if get_ss_pass_valid "$SS_METHOD_CUR" "$NEW_AUTH"; then break; fi
                         echo -e "${RED}[错误] 错误：$SS_METHOD_CUR 要求 base64 密钥且长度精确(16/32字节)，请重新输入！${PLAIN}" >&2
                     done
+                elif [ "$TYPE" == "snell" ]; then
+                    NEW_AUTH=$(get_snell_psk) || exit 1
                 else
                     NEW_AUTH=$(get_pass) || exit 1
                 fi
@@ -2208,6 +2515,7 @@ modify_config() {
                 else
                     local PASS_FILTER='(.inbounds[] | select(.tag==$tag) | .users[0].password) = $auth'
                     if [ "$TYPE" == "shadowsocks" ]; then PASS_FILTER='(.inbounds[] | select(.tag==$tag) | .password) = $auth'; fi
+                    if [ "$TYPE" == "snell" ]; then PASS_FILTER='(.inbounds[] | select(.tag==$tag) | .psk) = $auth'; fi
                     if ! apply_jq_config "$PASS_FILTER" --arg tag "$TAG" --arg auth "$NEW_AUTH"; then
                         restore_config_and_service || return 1
                         pause
@@ -2219,6 +2527,45 @@ modify_config() {
                     echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
                 else
                     echo -e "${GREEN}[完成] 节点秘钥已更新！${PLAIN}"; commit_config || return 1
+                fi
+                pause
+
+            elif [ "$action" == "snell_mode" ]; then
+                local NEW_MODE
+                NEW_MODE=$(get_snell_mode) || exit 1
+                if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .mode) = $m' --arg tag "$TAG" --arg m "$NEW_MODE"; then
+                    restore_config_and_service || return 1
+                    pause
+                    continue
+                fi
+                if ! restart_service; then
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
+                else
+                    echo -e "${GREEN}[完成] Snell v6 流量整形模式已更新为: $NEW_MODE${PLAIN}"; commit_config || return 1
+                fi
+                pause
+
+            elif [ "$action" == "ss_method" ]; then
+                local NEW_SS_METHOD
+                NEW_SS_METHOD=$(get_ss_method) || exit 1
+                local SS_DEFAULT_PASS
+                SS_DEFAULT_PASS=$(get_ss_password "$NEW_SS_METHOD")
+                local NEW_SS_PASS
+                while true; do
+                    ask "请输入对应新加密方式的SS密码 [默认自动生成]: " NEW_SS_PASS
+                    NEW_SS_PASS=${NEW_SS_PASS:-$SS_DEFAULT_PASS}
+                    if get_ss_pass_valid "$NEW_SS_METHOD" "$NEW_SS_PASS"; then break; fi
+                    echo -e "${RED}[错误] 错误：$NEW_SS_METHOD 要求 base64 密钥且长度精确(16/32字节)，请重新输入！${PLAIN}" >&2
+                done
+                if ! apply_jq_config '(.inbounds[] | select(.tag==$tag)) |= (.method = $m | .password = $pass)' --arg tag "$TAG" --arg m "$NEW_SS_METHOD" --arg pass "$NEW_SS_PASS"; then
+                    restore_config_and_service || return 1
+                    pause
+                    continue
+                fi
+                if ! restart_service; then
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
+                else
+                    echo -e "${GREEN}[完成] 加密方式与密码已更新！${PLAIN}"; commit_config || return 1
                 fi
                 pause
                 
@@ -2248,7 +2595,7 @@ modify_config() {
                 if [[ "$TYPE" == "vless" && "$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .transport.type // empty' "$CONFIG_FILE")" != "ws" ]]; then f_proto="tcp"; check_proto="tcp"
                 elif [[ "$TYPE" == "vless" ]]; then f_proto=""; check_proto="tcp"; IS_ARGO=1
                 elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "tuic" ]]; then f_proto="udp"; check_proto="udp"
-                elif [ "$TYPE" == "anytls" ]; then f_proto="tcp"; check_proto="tcp"
+                elif [[ "$TYPE" == "anytls" || "$TYPE" == "snell" ]]; then f_proto="tcp"; check_proto="tcp"
                 elif [ "$TYPE" == "shadowsocks" ]; then f_proto="both"; check_proto="both"
                 fi
 
@@ -2308,9 +2655,18 @@ modify_config() {
                         save_secret "ARGO_DOMAIN_${NEW_PORT}" "$A_DOM" || { restore_config_and_service || return 1; return 1; }
                     fi
                 fi
+                local OLD_HY2_HOP=""
+                if [ "$TYPE" == "hysteria2" ]; then
+                    local var_hop="HY2_HOP_${OLD_PORT}"
+                    OLD_HY2_HOP="${!var_hop:-}"
+                    if [ -n "$OLD_HY2_HOP" ]; then
+                        save_secret "HY2_HOP_${NEW_PORT}" "$OLD_HY2_HOP" || { restore_config_and_service || return 1; return 1; }
+                    fi
+                fi
 
                 local SEC_TYPE=""
                 [ "$IS_REALITY_NODE" -eq 1 ] && SEC_TYPE="vless"
+                [ "$TYPE" == "hysteria2" ] && SEC_TYPE="hysteria2"
                 if [ "$OLD_PORT" != "$NEW_PORT" ]; then
                     cleanup_node_secrets "$OLD_PORT" "$SEC_TYPE" "$IS_ARGO" || { restore_config_and_service || return 1; return 1; }
                 fi
@@ -2330,6 +2686,11 @@ modify_config() {
                         fi
                         ask "是否自动放行新端口？(y/n) [默认: y]: " auto_fw
                         if [[ "${auto_fw:-y}" == "y" || "${auto_fw:-y}" == "Y" ]]; then open_fw_port "$NEW_PORT" "$f_proto"; fi
+                    fi
+
+                    if [ "$TYPE" == "hysteria2" ] && [ -n "$OLD_HY2_HOP" ] && [ "$OLD_PORT" != "$NEW_PORT" ]; then
+                        remove_hy2_hop_nat "$OLD_PORT" "$OLD_HY2_HOP"
+                        apply_hy2_hop_nat "$NEW_PORT" "$OLD_HY2_HOP" && echo -e "${GREEN}[完成] 端口跳跃转发目标已同步更新至: ${NEW_PORT}/udp${PLAIN}"
                     fi
                     
                     if [ "$IS_ARGO" -eq 1 ]; then
@@ -2406,6 +2767,7 @@ del_config() {
         echo -e "选择: 删除节点\n"
         select_inbound || return
         
+        load_secrets
         local TYPE
         TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' "$CONFIG_FILE")
         local PORT
@@ -2413,6 +2775,11 @@ del_config() {
         local IS_ARGO
         IS_ARGO=$(jq -r --arg tag "$TAG" '[.inbounds[] | select(.tag==$tag) | .transport.type] | .[0] // ""' "$CONFIG_FILE" 2>/dev/null)
         [ "$IS_ARGO" == "ws" ] && IS_ARGO=1 || IS_ARGO=0
+        local OLD_HY2_HOP=""
+        if [ "$TYPE" == "hysteria2" ]; then
+            local var_hop="HY2_HOP_${PORT}"
+            OLD_HY2_HOP="${!var_hop:-}"
+        fi
         
         backup_config || return 1
         
@@ -2444,7 +2811,7 @@ del_config() {
         local f_proto=""
         if [[ "$TYPE" == "vless" && "$IS_ARGO" -eq 0 ]]; then f_proto="tcp"
         elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "tuic" ]]; then f_proto="udp"
-        elif [ "$TYPE" == "anytls" ]; then f_proto="tcp"
+        elif [[ "$TYPE" == "anytls" || "$TYPE" == "snell" ]]; then f_proto="tcp"
         elif [ "$TYPE" == "shadowsocks" ]; then f_proto="both"
         fi
 
@@ -2454,6 +2821,10 @@ del_config() {
             else
                 echo '节点已删除，但防火墙规则及记录保留，请手动核查。' >&2
             fi
+        fi
+
+        if [ "$TYPE" == "hysteria2" ] && [ -n "$OLD_HY2_HOP" ]; then
+            remove_hy2_hop_nat "$PORT" "$OLD_HY2_HOP"
         fi
         
         if [ "$IS_ARGO" -eq 1 ]; then
@@ -2615,10 +2986,10 @@ update_manage() {
                     ;;
                 3)
                     if [ -z "$NEW_VER" ]; then
-                        ask "获取最新版本失败，请手动输入要安装的版本号 (如 1.10.1): " NEW_VER
+                        ask "获取最新版本失败，请手动输入要安装的版本号 (如 1.14.4): " NEW_VER
                         [ -z "$NEW_VER" ] && { echo -e "${RED}[错误] 未输入版本号，已取消。${PLAIN}"; pause; break; }
                     fi
-                    if ! [[ "$NEW_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    if ! [[ "$NEW_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
                         echo -e "${RED}[错误] 版本号格式错误(应为 x.y.z)，已取消。${PLAIN}"
                         pause; break
                     fi
@@ -2874,7 +3245,12 @@ config_outbound() {
         local jq_success=0
         backup_config || return 1
         if [ "$strategy" == "auto" ]; then
-            apply_jq_config '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver)' && jq_success=1
+            apply_jq_config '
+              (.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver) |
+              if (.dns? != null) and ((.dns.rules? // []) | length == 0) and ((.dns.servers? // []) | map(select(.tag != "dns-local")) | length == 0) then
+                del(.dns)
+              else . end
+            ' && jq_success=1
         elif [ "$USE_NEW_FORMAT" -eq 1 ]; then
             apply_jq_config "
               $JQ_DNS_LOCAL |
@@ -3306,10 +3682,11 @@ rename_argo_service() {
 
 remove_fw_record() {
     local p="$1" proto="$2" tmp
+    local dash_p="${p//:/-}"
     [ -f "$FW_PORTS_FILE" ] || return 0
     tmp=$(mktemp "${FW_PORTS_FILE}.tmp.XXXXXX") || return 1
     SB_OWNED_TEMP_FILES+=("$tmp")
-    if awk -F/ -v p="$p" -v proto="$proto" \
+    if awk -F/ -v p="$dash_p" -v proto="$proto" \
         '!($1 == p && ($2 == proto || (proto == "both" && ($2 == "tcp" || $2 == "udp"))))' \
         "$FW_PORTS_FILE" > "$tmp" && mv -f "$tmp" "$FW_PORTS_FILE"; then return 0; fi
     rm -f "$tmp"; return 1
