@@ -264,7 +264,7 @@ upgrade_config_schema() {
 
     if jq "$filter" "$target_file" > "$tmp" &&
        jq -e 'type == "object" and (.inbounds | type == "array")' "$tmp" >/dev/null &&
-       chmod 600 "$tmp" && mv -f "$tmp" "$target_file"; then
+       chmod 600 "$tmp" && mv -f "$tmp" "$CONFIG_FILE"; then
         return 0
     fi
     rm -f "$tmp"
@@ -1732,7 +1732,9 @@ build_share_url() {
             ;;
         snell)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Snell 链接]${PLAIN}"; return; fi
-            printf '%s\n' "${TAG} = snell, ${CONN_ADDR_URI}, ${PORT}, psk=${N_PASS}, version=${SNELL_VER:-6}, reuse=true, tfo=true"
+            local PSK_ENC
+            PSK_ENC=$(url_encode "$N_PASS")
+            printf '%s\n' "Snell://${PSK_ENC}@${CONN_ADDR_URI}:${PORT}?version=${SNELL_VER:-6}#${TAG}"
             ;;
     esac
 }
@@ -1983,7 +1985,7 @@ add_config() {
             4) DEF_TAG="anytls" ;;
             5) DEF_TAG="vless-argo" ;;
             6) DEF_TAG="shadowsocks" ;;
-            7) DEF_TAG="snell" ;;
+            7) DEF_TAG="Snellv6" ;;
         esac
         DEF_TAG="${DEF_TAG}-${HOST_NAME}"
         
