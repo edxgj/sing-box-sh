@@ -13,3 +13,5 @@ AnyTLS
 VLESS-Argo
 
 shadowsocks
+
+Snellv6
